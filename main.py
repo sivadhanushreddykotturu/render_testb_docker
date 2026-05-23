@@ -1,21 +1,17 @@
 from fastapi import FastAPI, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from bs4 import BeautifulSoup
+from contextlib import asynccontextmanager
 import httpx
-import asyncio
-from io import BytesIO
 import logging
 import os
-import secrets
-from datetime import datetime, timedelta
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 import json
 import numpy as np
 from PIL import Image
 import onnxruntime as ort
 import io
 import time
+import re
 
 # ------------------ CAPTCHA SOLVER INIT ------------------
 try:
@@ -49,12 +45,31 @@ def solve_captcha(image_bytes: bytes) -> str:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="TimeTable & Attendance Backend", version="5.2.0 (Cookie Fix + Debug Logs)")
+# ------------------ STRUCTURAL STATICS ------------------
+BASE_URL = "https://newerp.kluniversity.in"
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1"
+}
 
-@app.on_event("startup")
-async def startup_event():
-    logger.info("✅ FastAPI app starting (Cookie Fix + Debug Logs Enabled)...")
-    logger.info(f"Environment: PORT={os.getenv('PORT', '8080')}")
+# ------------------ GLOBAL CONNECTION LIFESPAN ------------------
+# We use an httpx.AsyncLimits pool to back individual isolated client frames natively.
+limits_pool = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global limits_pool
+    logger.info("✅ FastAPI app starting (Universal Concurrent Auto-Healing Engine)...")
+    limits_pool = httpx.Limits(max_keepalive_connections=50, max_connections=200, keepalive_expiry=30.0)
+    logger.info("🚀 Global Concurrent Resource Pool initialized.")
+    yield
+    logger.info("🛑 Global Connection Pool safely terminated.")
+
+app = FastAPI(title="TimeTable & Attendance Backend", version="7.3.0", lifespan=lifespan)
 
 # ------------------ CORS ------------------
 app.add_middleware(
@@ -68,31 +83,9 @@ app.add_middleware(
 # ------------------ HEALTH ------------------
 @app.get("/")
 def health():
-    return {"message": "Backend running ✅ (Cookie Fix + Debug Logs)", "status": "healthy"}
+    return {"message": "Backend running high-speed concurrent loops ✅", "status": "healthy"}
 
-# ------------------ CAPTCHA STORE ------------------
-# Store: { session_id: { "cookies": httpx.Cookies, "csrf": str, "created_at": datetime } }
-captcha_sessions = {}
-
-def cleanup_expired_sessions():
-    current_time = datetime.now()
-    expired = [
-        sid for sid, d in captcha_sessions.items()
-        if current_time - d["created_at"] > timedelta(minutes=10)
-    ]
-    for sid in expired:
-        del captcha_sessions[sid]
-    if expired:
-        logger.info(f"🧹 Cleaned up {len(expired)} expired sessions")
-
-BASE_URL = "https://newerp.kluniversity.in"
-DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0"}
-
-# ------------------ DEBUG HELPERS ------------------
-def log_html_snippet(tag: str, html: str, length: int = 800):
-    snippet = html[:length].replace("\n", " ").replace("\r", " ")
-    logger.info(f"[{tag}] HTML snippet ({length} chars): {snippet}")
-
+# ------------------ UTILS ------------------
 def is_login_failed(response: httpx.Response) -> bool:
     url_str = str(response.url)
     if "site%2Flogin" in url_str or "site/login" in url_str:
@@ -103,56 +96,118 @@ def is_login_failed(response: httpx.Response) -> bool:
         return True
     return False
 
-# ------------------ HELPERS ------------------
-async def auto_login(client: httpx.AsyncClient, username: str, password: str) -> httpx.Response:
-    login_url = f"{BASE_URL}/index.php?r=site%2Flogin"
+def extract_csrf(html: str) -> str:
+    m = re.search(r'name="csrf-token"\s+content="([^"]+)"', html)
+    if m:
+        return m.group(1)
+    m = re.search(r'<input[^>]+name="_csrf"[^>]+value="([^"]+)"', html)
+    if m:
+        return m.group(1)
+    m = re.search(r'<input[^>]+value="([^"]+)"[^>]+name="_csrf"', html)
+    if m:
+        return m.group(1)
+    return ""
 
-    logger.info(f"[LOGIN] Attempting auto-login for user={username}")
-    
-    # 1. Fetch CSRF
-    res = await client.get(login_url, headers=DEFAULT_HEADERS, timeout=30)
+def collect_cookies(response: httpx.Response, base: dict) -> dict:
+    merged = dict(base)
+    for header_val in response.headers.get_list("set-cookie"):
+        part = header_val.split(";")[0].strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            merged[k.strip()] = v.strip()
+    return merged
+
+async def _follow_redirects_collecting_cookies(
+    client: httpx.AsyncClient, method: str, url: str, step_cookies: dict, timeout: int = 30, **kwargs
+) -> tuple[httpx.Response, dict]:
+    """
+    THREAD-SAFE COURIER: Executes manual tracking utilizing isolated client 
+    contexts passed directly from specific invocation runtimes.
+    """
+    current_url = url
+    current_cookies = dict(step_cookies)
+    max_redirects = 10
+
+    for _ in range(max_redirects):
+        if method == "POST":
+            resp = await client.post(
+                current_url, cookies=current_cookies,
+                follow_redirects=False, timeout=timeout, **kwargs
+            )
+        else:
+            resp = await client.get(
+                current_url, cookies=current_cookies,
+                follow_redirects=False, timeout=timeout, **kwargs
+            )
+
+        current_cookies = collect_cookies(resp, current_cookies)
+
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("location", "")
+            if not location:
+                break
+            if location.startswith("/"):
+                parsed = urlparse(current_url)
+                location = f"{parsed.scheme}://{parsed.netloc}{location}"
+            elif not location.startswith("http"):
+                location = BASE_URL + "/" + location
+            current_url = location
+            method = "GET"
+            kwargs = {}
+        else:
+            return resp, current_cookies
+
+    return resp, current_cookies
+
+# ------------------ AUTO LOGIN (THREAD ISOLATED) ------------------
+async def auto_login(client: httpx.AsyncClient, username: str, password: str, seed_cookies: dict) -> tuple[httpx.Response, dict]:
+    login_url = f"{BASE_URL}/index.php?r=site%2Flogin"
+    logger.info(f"[LOGIN] Running thread-isolated ONNX auto-login for user={username}")
+
+    res, step_cookies = await _follow_redirects_collecting_cookies(client, "GET", login_url, {})
     res.raise_for_status()
-    soup = BeautifulSoup(res.text, "html.parser")
-    csrf_meta = soup.find("meta", {"name": "csrf-token"})
-    if not csrf_meta:
-        raise Exception("CSRF token not found on login page")
-    csrf = csrf_meta["content"]
-    
-    # 2. Trigger CAPTCHA dummy post
+
+    csrf = extract_csrf(res.text)
+    if not csrf:
+        raise Exception("CSRF token not found on login page.")
+
     dummy_data = {"_csrf": csrf, "LoginForm[username]": "", "LoginForm[password]": ""}
-    res_post = await client.post(login_url, data=dummy_data, headers=DEFAULT_HEADERS, timeout=30)
-    res_post.raise_for_status()
-    soup_post = BeautifulSoup(res_post.text, "html.parser")
-    
-    captcha_img = (
-        soup_post.find("img", src=lambda x: x and "r=site%2Fcaptcha" in x)
-        or soup.find("img", src=lambda x: x and "r=site%2Fcaptcha" in x)
+    res_post, step_cookies = await _follow_redirects_collecting_cookies(
+        client, "POST", login_url, step_cookies, data=dummy_data
     )
-    if not captcha_img:
-        raise Exception("CAPTCHA image not found.")
-    
-    captcha_url = BASE_URL + captcha_img["src"].replace("&amp;", "&")
-    captcha_response = await client.get(captcha_url, timeout=30)
+    res_post.raise_for_status()
+
+    captcha_match = re.search(r'src="([^"]*?r=site%2Fcaptcha[^"]*?)"', res_post.text)
+    if not captcha_match:
+        raise Exception("CAPTCHA image locator missing from layout.")
+
+    captcha_url = BASE_URL + captcha_match.group(1).replace("&amp;", "&")
+    captcha_response, step_cookies = await _follow_redirects_collecting_cookies(
+        client, "GET", captcha_url, step_cookies
+    )
     captcha_response.raise_for_status()
-    
-    # 3. Solve CAPTCHA
+
     captcha_text = solve_captcha(captcha_response.content)
-    logger.info(f"[LOGIN] Auto-solved captcha: {captcha_text}")
-    
-    # 4. Login POST
+    logger.info(f"[LOGIN] Captcha solved: {captcha_text}")
+
     payload = {
         "_csrf": csrf,
         "LoginForm[username]": username,
         "LoginForm[password]": password,
         "LoginForm[captcha]": captcha_text,
+        "LoginForm[rememberMe]": "0",
         "LoginForm[qr_code]": "",
     }
-    
-    response = await client.post(login_url, data=payload, headers=DEFAULT_HEADERS, timeout=30)
-    logger.info(f"[LOGIN] Status Code: {response.status_code}, Final URL: {response.url}")
+    response, final_cookies = await _follow_redirects_collecting_cookies(
+        client, "POST", login_url, step_cookies, data=payload
+    )
     response.raise_for_status()
-    return response
 
+    for key in ("kl_erp_device_id", "SERVERID"):
+        if key not in final_cookies and key in seed_cookies:
+            final_cookies[key] = seed_cookies[key]
+
+    return response, final_cookies
 
 def build_register_url(base_url: str, href: str) -> str | None:
     try:
@@ -165,344 +220,412 @@ def build_register_url(base_url: str, href: str) -> str | None:
             return f"{base_url}/index.php?r={r_path}{params_raw}"
         return f"{base_url}/index.php?r={unquote(register_url_segment)}"
     except Exception as e:
-        logger.error(f"[REGISTER_URL] Failed to build URL. href={href}, error={e}")
-        with open("error_log.txt", "a") as f:
-            f.write(f"Failed to build URL. href={href}, error={e}\n")
+        logger.error(f"[REGISTER_URL] Reconstruct error: {e}")
         return None
 
+# ------------------ LOGIN ENDPOINT ------------------
+@app.post("/login")
+async def login(username: str = Form(...), password: str = Form(...)):
+    try:
+        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS) as client:
+            login_response = None
+            fresh_cookies = {}
+            for attempt in range(3):
+                login_response, fresh_cookies = await auto_login(client, username, password, seed_cookies={})
+                if not is_login_failed(login_response):
+                    break
+                logger.warning(f"[LOGIN] Attempt {attempt+1} rejected. Retrying captcha.")
+            else:
+                raise HTTPException(status_code=401, detail="Invalid credentials or captcha timeout.")
 
-async def fetch_register_details(client: httpx.AsyncClient, href: str, csrf: str) -> dict:
-    register_url = build_register_url(BASE_URL, href)
-    if not register_url:
-        return {"message": "Could not reconstruct register URL."}
+            fresh_csrf = extract_csrf(login_response.text)
+            return {
+                "success": True,
+                "message": "Cookies generated successfully.",
+                "cookies": {
+                    "PHPSESSID": fresh_cookies.get("PHPSESSID"),
+                    "kl_erp_device_id": fresh_cookies.get("kl_erp_device_id"),
+                    "SERVERID": fresh_cookies.get("SERVERID", "erp3"),
+                    "_csrf_token": fresh_csrf
+                }
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[LOGIN_ROUTE] Exception: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal processing fault during authorization sync.")
+
+# ------------------ FETCH ATTENDANCE ------------------
+@app.post("/fetch-attendance")
+async def fetch_attendance_summary(
+    username: str = Form(...),
+    password: str = Form(...),
+    php_sess_id: str = Form(...),
+    csrf_cookie: str = Form(...),
+    device_id: str = Form(...),
+    server_id: str = Form(default="erp3"),
+    academic_year_code: str = Form(...),
+    semester_id: str = Form(...)
+):
+    start_time = time.time()
+    cookie_jar = {
+        "_csrf": unquote(csrf_cookie),
+        "PHPSESSID": php_sess_id,
+        "kl_erp_device_id": unquote(device_id),
+        "SERVERID": server_id
+    }
+    attendance_url = f"{BASE_URL}/index.php?r=studentattendance%2Fstudentdailyattendance%2Fcourselist"
+
+    def _make_payload(csrf: str) -> dict:
+        return {
+            "_csrf": csrf,
+            "DynamicModel[academicyear]": academic_year_code,
+            "DynamicModel[semesterid]": semester_id,
+        }
 
     try:
-        register_url_with_csrf = f"{register_url}&_csrf={csrf}"
-        logger.info(f"[REGISTER] Fetching register: {register_url_with_csrf}")
+        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS) as client:
+            logger.info(f"[ATTENDANCE] Isolated POST query initialization (PHPSESSID={php_sess_id[:6]}...)")
+            post_response, cookie_jar = await _follow_redirects_collecting_cookies(
+                client, "POST", attendance_url, cookie_jar, timeout=15,
+                data=_make_payload(unquote(csrf_cookie))
+            )
 
-        resp = await client.get(register_url_with_csrf, headers=DEFAULT_HEADERS, timeout=30)
+            if is_login_failed(post_response):
+                logger.warning("[ATTENDANCE] Session expired. Running automatic fallback healer...")
+                for attempt in range(3):
+                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
+                    if not is_login_failed(login_response):
+                        break
+                else:
+                    raise HTTPException(status_code=401, detail="ERP system rejected fallback login.")
 
-        logger.info(f"[REGISTER] Status Code: {resp.status_code}")
-        logger.info(f"[REGISTER] Final URL: {resp.url}")
+                fresh_csrf = extract_csrf(login_response.text)
+                if not fresh_csrf:
+                    raise HTTPException(status_code=500, detail="Could not reconcile session CSRF signatures.")
 
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+                post_response, cookie_jar = await _follow_redirects_collecting_cookies(
+                    client, "POST", attendance_url, cookie_jar, timeout=15,
+                    data=_make_payload(fresh_csrf)
+                )
 
-        table_container = soup.find("div", class_="card-body") or soup.find("div", id="w0")
-        table_register = table_container.find("table", class_="table table-striped table-bordered") if table_container else None
+            post_response.raise_for_status()
+            html_content = post_response.text
 
-        if not table_register:
-            log_html_snippet("REGISTER_PAGE_NO_TABLE", resp.text)
-            return {"message": "No register table found on detail page."}
+        table_match = re.search(r'<table.*?>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
+        if not table_match:
+            raise ValueError("Attendance table layout structure unverified.")
 
-        all_headers = [th.text.strip() for th in table_register.find("thead").find_all("th") if th.text.strip()]
+        table_body = table_match.group(1)
+        tbody_match = re.search(r'<tbody.*?>(.*?)</tbody>', table_body, re.DOTALL | re.IGNORECASE)
+        if not tbody_match:
+            return {"success": True, "attendance": [], "message": "Attendance arrays are empty."}
+
+        raw_rows = re.findall(r'<tr.*?>(.*?)</tr>', tbody_match.group(1), re.DOTALL | re.IGNORECASE)
+        attendance_data = []
+
+        for row in raw_rows:
+            cells = re.findall(r'<td.*?>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
+            if not cells or len(cells) < 14:
+                continue
+            href_match = re.search(r'href=["\'](.*?)["\']', cells[13], re.IGNORECASE)
+            raw_href = href_match.group(1) if href_match else None
+            clean_href = raw_href.replace("&amp;", "&") if raw_href else None
+
+            attendance_data.append({
+                "index": re.sub(r'<.*?>', '', cells[0]).strip(),
+                "course_code": re.sub(r'<.*?>', '', cells[1]).strip(),
+                "course_name": re.sub(r'<.*?>', '', cells[2]).strip(),
+                "type": re.sub(r'<.*?>', '', cells[3]).strip(),
+                "section": re.sub(r'<.*?>', '', cells[4]).strip(),
+                "academic_year": re.sub(r'<.*?>', '', cells[5]).strip(),
+                "semester": re.sub(r'<.*?>', '', cells[6]).strip(),
+                "conducted": re.sub(r'<.*?>', '', cells[8]).strip(),
+                "attended": re.sub(r'<.*?>', '', cells[9]).strip(),
+                "absent": re.sub(r'<.*?>', '', cells[10]).strip(),
+                "percentage": re.sub(r'<.*?>', '', cells[12]).strip(),
+                "register_href": clean_href
+            })
+
+        updated_session_id = cookie_jar.get("PHPSESSID")
+        has_refreshed = updated_session_id != php_sess_id
+
+        return {
+            "success": True,
+            "session_refreshed": has_refreshed,
+            "cookies": {
+                "PHPSESSID": updated_session_id,
+                "_csrf_token": cookie_jar.get("_csrf"),
+                "_csrf": cookie_jar.get("_csrf"),
+                "kl_erp_device_id": cookie_jar.get("kl_erp_device_id", device_id),
+                "SERVERID": cookie_jar.get("SERVERID", server_id)
+            },
+            "attendance": attendance_data
+        }
+    except Exception as e:
+        logger.error(f"[ATTENDANCE] Crash: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ------------------ FETCH REGISTER DETAIL ------------------
+@app.post("/fetch-register-detail")
+async def fetch_register_detail(
+    username: str = Form(...),
+    password: str = Form(...),
+    php_sess_id: str = Form(...),
+    csrf_cookie: str = Form(...),
+    device_id: str = Form(...),
+    server_id: str = Form(default="erp3"),
+    register_href: str = Form(...)
+):
+    register_url = build_register_url(BASE_URL, register_href)
+    if not register_url:
+        raise HTTPException(status_code=400, detail="Target path failure.")
+
+    cookie_jar = {
+        "_csrf": unquote(csrf_cookie),
+        "PHPSESSID": php_sess_id,
+        "kl_erp_device_id": unquote(device_id),
+        "SERVERID": server_id
+    }
+
+    try:
+        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS) as client:
+            register_url_with_csrf = f"{register_url}&_csrf={unquote(csrf_cookie)}"
+            response = await client.get(register_url_with_csrf, cookies=cookie_jar, timeout=15)
+
+            if response.status_code == 500 or is_login_failed(response):
+                logger.warning("[LAZY-REGISTER] Session invalid. Auto-healing context stream...")
+                for attempt in range(3):
+                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
+                    if not is_login_failed(login_response):
+                        break
+                else:
+                    raise HTTPException(status_code=401, detail="Authentication credentials expired.")
+
+                fresh_csrf = extract_csrf(login_response.text) or cookie_jar.get("_csrf", "")
+                register_url_with_csrf = f"{register_url}&_csrf={fresh_csrf}"
+                response = await client.get(register_url_with_csrf, cookies=cookie_jar, timeout=15)
+
+            response.raise_for_status()
+            html_text = response.text
+
+        table_match = re.search(
+            r'<table[^>]*class=["\']table table-striped table-bordered["\'][^>]*>(.*?)</table>',
+            html_text, re.DOTALL | re.IGNORECASE
+        )
+        if not table_match:
+            return {"success": False, "message": "Register table missing."}
+
+        table_body = table_match.group(1)
+        raw_headers = re.findall(r'<th.*?>(.*?)</th>', table_body, re.IGNORECASE)
+        headers = [re.sub(r'<.*?>', '', h).strip() for h in raw_headers if h.strip()]
+
         metadata_count = 14
-        metadata_headers = all_headers[:metadata_count]
-        daily_headers = all_headers[metadata_count:]
+        metadata_headers = headers[:metadata_count]
+        daily_headers = headers[metadata_count:]
 
-        rows = table_register.find("tbody").find_all("tr")
-        if not rows:
-            return {"message": "No rows found in register tbody."}
+        tbody_match = re.search(r'<tbody.*?>(.*?)</tbody>', table_body, re.DOTALL | re.IGNORECASE)
+        if not tbody_match:
+            return {"success": False, "message": "Calendar data rows missing."}
 
-        cells = rows[0].find_all("td")
+        cells = re.findall(r'<td.*?>(.*?)</td>', tbody_match.group(1), re.DOTALL | re.IGNORECASE)
         if len(cells) < metadata_count:
-            return {"message": f"Incomplete data. Expected {metadata_count} cells, got {len(cells)}."}
+            return {"success": False, "message": "Truncated layout array returns."}
 
-        metadata = {header: cells[i].text.strip() for i, header in enumerate(metadata_headers) if i < len(cells)}
+        metadata = {header: re.sub(r'<.*?>', '', cells[i]).strip()
+                    for i, header in enumerate(metadata_headers) if i < len(cells)}
+
         daily_attendance = [
-            {"date_slot": header, "status": cells[metadata_count + i].text.strip()}
+            {"date_slot": header, "status": re.sub(r'<.*?>', '', cells[metadata_count + i]).strip()}
             for i, header in enumerate(daily_headers)
             if metadata_count + i < len(cells)
         ]
 
-        logger.info(f"[REGISTER] Parsed metadata keys: {list(metadata.keys())}")
-        logger.info(f"[REGISTER] Parsed daily attendance entries: {len(daily_attendance)}")
+        updated_session_id = cookie_jar.get("PHPSESSID")
+        has_refreshed = updated_session_id != php_sess_id
 
-        return {"metadata": metadata, "daily_attendance": daily_attendance}
-
-    except httpx.HTTPStatusError as e:
-        logger.error(f"[REGISTER] HTTP error: {e}")
-        return {"message": "Network/authorization error fetching register."}
+        return {
+            "success": True,
+            "session_refreshed": has_refreshed,
+            "cookies": {
+                "PHPSESSID": updated_session_id,
+                "_csrf": cookie_jar.get("_csrf"),
+                "kl_erp_device_id": cookie_jar.get("kl_erp_device_id", device_id),
+                "SERVERID": cookie_jar.get("SERVERID", server_id)
+            } if has_refreshed else {},
+            "metadata": metadata,
+            "daily_attendance": daily_attendance
+        }
     except Exception as e:
-        logger.error(f"[REGISTER] Parsing error: {e}", exc_info=True)
-        return {"message": "Error parsing register details."}
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-# ------------------ CAPTCHA ROUTE ------------------
-@app.get("/get-captcha")
-async def get_captcha():
-    cleanup_expired_sessions()
-    login_url = f"{BASE_URL}/index.php?r=site%2Flogin"
+# ------------------ FETCH SEATING PLAN ------------------
+@app.post("/fetch-seating-plan")
+async def fetch_seating_plan(
+    username: str = Form(...),
+    password: str = Form(...),
+    php_sess_id: str = Form(...),
+    csrf_cookie: str = Form(...),
+    device_id: str = Form(...),
+    server_id: str = Form(default="erp3")
+):
+    cookie_jar = {
+        "_csrf": unquote(csrf_cookie),
+        "PHPSESSID": php_sess_id,
+        "kl_erp_device_id": unquote(device_id),
+        "SERVERID": server_id
+    }
+    seating_plan_url = f"{BASE_URL}/index.php?r=examsection%2Fexam-invigilator-student-room-allotment-info%2Fstud_my_seating_plan"
 
     try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            logger.info("[CAPTCHA] Fetching login page...")
+        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS) as client:
+            response = await client.get(seating_plan_url, cookies=cookie_jar, timeout=15)
 
-            res = await client.get(login_url, headers=DEFAULT_HEADERS, timeout=30)
-            logger.info(f"[CAPTCHA] Login page status: {res.status_code}")
-            res.raise_for_status()
+            if response.status_code == 500 or is_login_failed(response):
+                logger.warning("[SEATING] Session invalid. Executing tracking fallback...")
+                for attempt in range(3):
+                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
+                    if not is_login_failed(login_response):
+                        break
+                else:
+                    raise HTTPException(status_code=401, detail="ERP Session rejected.")
 
-            soup = BeautifulSoup(res.text, "html.parser")
-            csrf_meta = soup.find("meta", {"name": "csrf-token"})
-            if not csrf_meta:
-                logger.error("[CAPTCHA] CSRF token not found on login page")
-                raise HTTPException(status_code=500, detail="Failed to get CSRF token")
+                response = await client.get(seating_plan_url, cookies=cookie_jar, timeout=15)
 
-            csrf = csrf_meta["content"]
-            logger.info(f"[CAPTCHA] CSRF token extracted: {csrf[:25]}...")
+            response.raise_for_status()
+            html_content = response.text
 
-            logger.info("[CAPTCHA] Triggering captcha generation using dummy POST...")
-            dummy_data = {"_csrf": csrf, "LoginForm[username]": "", "LoginForm[password]": ""}
+        table_match = re.search(r'<table.*?>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
+        if not table_match:
+            raise HTTPException(status_code=404, detail="Seating plan layout missing.")
 
-            res_post = await client.post(login_url, data=dummy_data, headers=DEFAULT_HEADERS, timeout=30)
-            logger.info(f"[CAPTCHA] Dummy POST status: {res_post.status_code}")
-            res_post.raise_for_status()
+        table_body = table_match.group(1)
+        tbody_match = re.search(r'<tbody.*?>(.*?)</tbody>', table_body, re.DOTALL | re.IGNORECASE)
+        if not tbody_match:
+            return {"success": True, "seating_plan": [], "message": "No exam schedules mapped."}
 
-            soup_post = BeautifulSoup(res_post.text, "html.parser")
+        rows = re.findall(r'<tr.*?>(.*?)</tr>', tbody_match.group(1), re.DOTALL | re.IGNORECASE)
+        seating_plan_data = []
 
-            captcha_img = (
-                soup_post.find("img", src=lambda x: x and "r=site%2Fcaptcha" in x)
-                or soup.find("img", src=lambda x: x and "r=site%2Fcaptcha" in x)
-            )
-            if not captcha_img:
-                logger.error("[CAPTCHA] CAPTCHA image not found in response HTML")
-                log_html_snippet("CAPTCHA_HTML", res_post.text)
-                raise HTTPException(status_code=500, detail="CAPTCHA image not found.")
+        for row in rows:
+            cells = re.findall(r'<td.*?>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
+            if not cells or len(cells) < 8:
+                continue
+            seating_plan_data.append({
+                "index": re.sub(r'<.*?>', '', cells[0]).strip(),
+                "ref_id": re.sub(r'<.*?>', '', cells[1]).strip(),
+                "date": re.sub(r'<.*?>', '', cells[2]).strip(),
+                "exam_type": re.sub(r'<.*?>', '', cells[3]).strip(),
+                "time_slot": re.sub(r'<.*?>', '', cells[4]).strip(),
+                "university_id": re.sub(r'<.*?>', '', cells[5]).strip(),
+                "course_code": re.sub(r'<.*?>', '', cells[6]).strip(),
+                "room_no": re.sub(r'<.*?>', '', cells[7]).strip()
+            })
 
-            captcha_url = BASE_URL + captcha_img["src"].replace("&amp;", "&")
-            logger.info(f"[CAPTCHA] Captcha URL: {captcha_url}")
+        updated_session_id = cookie_jar.get("PHPSESSID")
+        has_refreshed = updated_session_id != php_sess_id
 
-            captcha_response = await client.get(captcha_url, timeout=30)
-            logger.info(f"[CAPTCHA] Captcha image status: {captcha_response.status_code}")
-            captcha_response.raise_for_status()
-
-            session_id = secrets.token_urlsafe(16)
-
-            # ✅ IMPORTANT FIX: Store cookies as httpx.Cookies object, not dict
-            captcha_sessions[session_id] = {
-                "cookies": client.cookies,
-                "csrf": csrf,
-                "created_at": datetime.now(),
-            }
-
-            logger.info(f"[CAPTCHA] Session created: {session_id[:8]}...")
-            logger.info(f"[CAPTCHA] Cookies stored: {list(client.cookies.keys())}")
-
-            response = StreamingResponse(BytesIO(captcha_response.content), media_type="image/jpeg")
-            response.headers["X-Session-ID"] = session_id
-            return response
-
-    except httpx.RequestError as e:
-        logger.error(f"[CAPTCHA] Network error: {e}")
-        raise HTTPException(status_code=500, detail="Network error while fetching CAPTCHA")
+        return {
+            "success": True,
+            "session_refreshed": has_refreshed,
+            "cookies": {
+                "PHPSESSID": updated_session_id,
+                "_csrf": cookie_jar.get("_csrf"),
+                "kl_erp_device_id": cookie_jar.get("kl_erp_device_id", device_id),
+                "SERVERID": cookie_jar.get("SERVERID", server_id)
+            } if has_refreshed else {},
+            "seating_plan": seating_plan_data
+        }
     except Exception as e:
-        logger.error(f"[CAPTCHA] Unexpected error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
-
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ------------------ FETCH TIMETABLE ------------------
 @app.post("/fetch-timetable")
 async def fetch_timetable(
     username: str = Form(...),
     password: str = Form(...),
-    captcha: str = Form(default=""),
-    session_id: str = Form(default=""),
+    php_sess_id: str = Form(...),
+    csrf_cookie: str = Form(...),
+    device_id: str = Form(...),
+    server_id: str = Form(default="erp3"),
     academic_year_code: str = Form(default="19"),
     semester_id: str = Form(default="1")
 ):
-    logger.info(f"[TIMETABLE] Request received for user={username}")
+    cookie_jar = {
+        "_csrf": unquote(csrf_cookie),
+        "PHPSESSID": php_sess_id,
+        "kl_erp_device_id": unquote(device_id),
+        "SERVERID": server_id
+    }
+    tt_url = (
+        f"{BASE_URL}/index.php?r=timetables%2Funiversitymasteracademictimetableview%2Findividualstudenttimetableget"
+        f"&UniversityMasterAcademicTimetableView%5Bacademicyear%5D={academic_year_code}"
+        f"&UniversityMasterAcademicTimetableView%5Bsemesterid%5D={semester_id}"
+    )
 
     try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            login_response = None
-            for attempt in range(3):
-                login_response = await auto_login(client, username, password)
-                if not is_login_failed(login_response):
-                    break
-                logger.warning(f"[TIMETABLE] Login failed (attempt {attempt+1}), retrying...")
-            else:
-                logger.error("[TIMETABLE] Login failed after 3 attempts")
-                raise HTTPException(status_code=400, detail="Invalid credentials or unable to auto-solve captcha")
+        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS) as client:
+            response = await client.get(tt_url, cookies=cookie_jar, timeout=12)
 
-            logger.info("[TIMETABLE] Login successful")
+            if response.status_code == 500 or is_login_failed(response):
+                logger.warning("[TIMETABLE] Session invalid. Executing automated auto-healing...")
+                for attempt in range(3):
+                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
+                    if not is_login_failed(login_response):
+                        break
+                else:
+                    raise HTTPException(status_code=401, detail="ERP credentials invalid.")
 
-            tt_url = (
-                f"{BASE_URL}/index.php?r=timetables%2Funiversitymasteracademictimetableview%2Findividualstudenttimetableget"
-                f"&UniversityMasterAcademicTimetableView%5Bacademicyear%5D={academic_year_code}"
-                f"&UniversityMasterAcademicTimetableView%5Bsemesterid%5D={semester_id}"
-            )
+                response = await client.get(tt_url, cookies=cookie_jar, timeout=15)
 
-            logger.info(f"[TIMETABLE] Fetching timetable URL: {tt_url}")
+            response.raise_for_status()
+            html_content = response.text
 
-            tt_response = await client.get(tt_url, headers=DEFAULT_HEADERS, timeout=30)
+        table_match = re.search(r'<table.*?>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
+        if not table_match:
+            raise HTTPException(status_code=404, detail="Timetable grid missing.")
 
-            logger.info(f"[TIMETABLE] Status Code: {tt_response.status_code}")
-            logger.info(f"[TIMETABLE] Final URL: {tt_response.url}")
+        table_body = table_match.group(1)
+        thead_match = re.search(r'<thead.*?>(.*?)</thead>', table_body, re.DOTALL | re.IGNORECASE)
+        if not thead_match:
+            raise HTTPException(status_code=500, detail="Failed to locate timetable header.")
 
-            tt_response.raise_for_status()
+        raw_headers = re.findall(r'<th.*?>(.*?)</th>', thead_match.group(1), re.IGNORECASE)
+        headers = [re.sub(r'<.*?>', '', h).strip() for h in raw_headers][1:]
 
-            soup_tt = BeautifulSoup(tt_response.text, "html.parser")
-            log_html_snippet("TIMETABLE_PAGE", tt_response.text)
+        tbody_match = re.search(r'<tbody.*?>(.*?)</tbody>', table_body, re.DOTALL | re.IGNORECASE)
+        if not tbody_match:
+            return {"success": True, "timetable": {}, "message": "Timetable schedules are empty."}
 
-            table = soup_tt.find("table")
-            if not table:
-                logger.error("[TIMETABLE] Timetable table not found")
-                raise HTTPException(status_code=404, detail="Timetable not found")
+        rows = re.findall(r'<tr.*?>(.*?)</tr>', tbody_match.group(1), re.DOTALL | re.IGNORECASE)
+        timetable_data = {}
 
-            headers = [th.text.strip() for th in table.find("thead").find_all("th")][1:]
-            logger.info(f"[TIMETABLE] Headers extracted: {headers}")
+        for row in rows:
+            cells = re.findall(r'<td.*?>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
+            if not cells:
+                continue
+            day_name = re.sub(r'<.*?>', '', cells[0]).strip()
+            slot_contents = [re.sub(r'<.*?>', '', cell).strip() for cell in cells[1:]]
+            timetable_data[day_name] = dict(zip(headers, slot_contents))
 
-            timetable = {}
-            for row in table.find("tbody").find_all("tr"):
-                cols = row.find_all("td")
-                if not cols:
-                    continue
-                day = cols[0].text.strip()
-                slots = [td.text.strip() for td in cols[1:]]
-                timetable[day] = dict(zip(headers, slots))
+        updated_session_id = cookie_jar.get("PHPSESSID")
+        has_refreshed = updated_session_id != php_sess_id
 
-            logger.info(f"[TIMETABLE] Parsed timetable days count: {len(timetable)}")
-
-            return {"success": True, "timetable": timetable}
-
-    except httpx.RequestError as e:
-        logger.error(f"[TIMETABLE] Network error: {e}")
-        raise HTTPException(status_code=500, detail="Network error while fetching timetable")
-    except HTTPException:
-        raise
+        return {
+            "success": True,
+            "session_refreshed": has_refreshed,
+            "cookies": {
+                "PHPSESSID": updated_session_id,
+                "_csrf": cookie_jar.get("_csrf"),
+                "kl_erp_device_id": cookie_jar.get("kl_erp_device_id", device_id),
+                "SERVERID": cookie_jar.get("SERVERID", server_id)
+            } if has_refreshed else {},
+            "timetable": timetable_data
+        }
     except Exception as e:
-        logger.error(f"[TIMETABLE] Unexpected error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-# ------------------ FETCH ATTENDANCE ------------------
-@app.post("/fetch-attendance")
-async def fetch_attendance(
-    username: str = Form(...),
-    password: str = Form(...),
-    captcha: str = Form(default=""),
-    session_id: str = Form(default=""),
-    academic_year_code: str = Form(...),
-    semester_id: str = Form(...)
-):
-    logger.info(f"[ATTENDANCE] Request received for user={username}")
-
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, verify=False) as client:
-            login_response = None
-            for attempt in range(3):
-                login_response = await auto_login(client, username, password)
-                if not is_login_failed(login_response):
-                    break
-                logger.warning(f"[ATTENDANCE] Login failed (attempt {attempt+1}), retrying...")
-            else:
-                logger.error("[ATTENDANCE] Login failed after 3 attempts")
-                raise HTTPException(status_code=400, detail="Invalid credentials or unable to auto-solve captcha")
-
-            logger.info("[ATTENDANCE] Login successful")
-
-            post_login_soup = BeautifulSoup(login_response.text, "html.parser")
-            post_login_csrf_meta = post_login_soup.find("meta", {"name": "csrf-token"})
-            if not post_login_csrf_meta:
-                logger.error("[ATTENDANCE] CSRF token missing after login")
-                raise HTTPException(status_code=500, detail="Could not find CSRF token on post-login page.")
-
-            post_login_csrf = post_login_csrf_meta["content"]
-            logger.info(f"[ATTENDANCE] Post-login CSRF extracted: {post_login_csrf[:25]}...")
-
-            attendance_url = f"{BASE_URL}/index.php?r=studentattendance%2Fstudentdailyattendance%2Fcourselist"
-            attendance_payload = {
-                "_csrf": post_login_csrf,
-                "DynamicModel[academicyear]": academic_year_code,
-                "DynamicModel[semesterid]": semester_id,
-            }
-
-            logger.info(f"[ATTENDANCE] Posting course list request: {attendance_url}")
-            logger.info(f"[ATTENDANCE] Payload: {attendance_payload}")
-
-            attendance_response = await client.post(
-                attendance_url, data=attendance_payload, headers=DEFAULT_HEADERS, timeout=30
-            )
-
-            logger.info(f"[ATTENDANCE] Status Code: {attendance_response.status_code}")
-            logger.info(f"[ATTENDANCE] Final URL: {attendance_response.url}")
-
-            attendance_response.raise_for_status()
-
-            attendance_soup = BeautifulSoup(attendance_response.text, "html.parser")
-            log_html_snippet("ATTENDANCE_PAGE", attendance_response.text)
-
-            container = attendance_soup.find("div", id="w0")
-            if not container:
-                logger.error("[ATTENDANCE] Container div#w0 not found (HTML changed?)")
-                raise HTTPException(status_code=404, detail="Could not find the attendance data container.")
-
-            table = container.find("table", class_="table table-striped table-bordered")
-            if not table:
-                logger.error("[ATTENDANCE] Attendance table not found inside container")
-                raise HTTPException(status_code=404, detail="Could not find the attendance table.")
-
-            table_headers = [th.text.strip() for th in table.find("thead").find_all("th")]
-            rows = table.find("tbody").find_all("tr")
-
-            logger.info(f"[ATTENDANCE] Headers extracted: {table_headers}")
-            logger.info(f"[ATTENDANCE] Total rows found: {len(rows)}")
-
-            parsed_rows = []
-            register_hrefs = []
-
-            for row in rows:
-                cells = row.find_all("td")
-                if not cells:
-                    continue
-
-                row_data = {table_headers[i]: cells[i].text.strip() for i in range(len(table_headers) - 1)}
-                register_link = cells[-1].find("a", class_="crudjax")
-                href = register_link["href"] if (register_link and "href" in register_link.attrs) else None
-
-                parsed_rows.append(row_data)
-                register_hrefs.append(href)
-
-            logger.info(f"[ATTENDANCE] Register links found: {sum(1 for x in register_hrefs if x)} / {len(register_hrefs)}")
-            logger.info(f"[ATTENDANCE] Fetching {len(register_hrefs)} registers concurrently...")
-
-            async def _unavailable_register():
-                return {"message": "Register link not available"}
-
-            register_tasks = [
-                fetch_register_details(client, href, post_login_csrf) if href
-                else _unavailable_register()
-                for href in register_hrefs
-            ]
-
-            register_results = await asyncio.gather(*register_tasks, return_exceptions=False)
-
-            attendance_data = []
-            for row_data, register_details in zip(parsed_rows, register_results):
-                row_data["register_details"] = register_details
-                attendance_data.append(row_data)
-
-            if not attendance_data:
-                logger.warning("[ATTENDANCE] No attendance data found")
-                return {"success": True, "message": "No attendance data found for the selected period.", "attendance": []}
-
-            logger.info(f"[ATTENDANCE] Attendance data parsed successfully: {len(attendance_data)} courses")
-
-            return {"success": True, "attendance": attendance_data}
-
-    except httpx.RequestError as e:
-        logger.error(f"[ATTENDANCE] Network error: {e}")
-        raise HTTPException(status_code=500, detail="A network error occurred.")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"[ATTENDANCE] Unexpected error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal server error occurred.")
-    finally:
-        logger.info(f"[ATTENDANCE] Session {session_id[:8]}... cleaned up.")
-
-
-# ------------------ LATEST COMMIT ------------------
+# ------------------ GITHUB COMMIT ROUTE ------------------
 OWNER = "sivadhanushreddykotturu"
 REPO = "TimeTablekl"
 _cached_commit = None
@@ -515,7 +638,6 @@ async def latest_commit():
     global _cached_commit, _last_fetch_time
 
     if _cached_commit and (time.time() - _last_fetch_time < CACHE_TTL):
-        logger.info("[GITHUB] Returning cached commit info")
         return {**_cached_commit, "cached": True}
 
     url = f"https://api.github.com/repos/{OWNER}/{REPO}/commits"
@@ -525,12 +647,8 @@ async def latest_commit():
 
     try:
         async with httpx.AsyncClient() as client:
-            logger.info("[GITHUB] Fetching latest commit from GitHub API...")
             resp = await client.get(url, headers=headers, timeout=15)
-
-            logger.info(f"[GITHUB] Status Code: {resp.status_code}")
             resp.raise_for_status()
-
             data = resp.json()
 
         commit = data[0]
@@ -544,96 +662,6 @@ async def latest_commit():
 
         _cached_commit = latest
         _last_fetch_time = time.time()
-
-        logger.info("[GITHUB] Latest commit fetched successfully")
         return {**latest, "cached": False}
-
-    except httpx.HTTPStatusError as e:
-        logger.error(f"[GITHUB] HTTP error: {e}")
-        if e.response.status_code == 403:
-            raise HTTPException(status_code=429, detail="GitHub API rate limit reached or token missing.")
-        raise HTTPException(status_code=500, detail="Failed to fetch commit data from GitHub.")
     except Exception as e:
-        logger.error(f"[GITHUB] Unexpected error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
-
-
-# ------------------ FETCH SEATING PLAN ------------------
-@app.post("/fetch-seating-plan")
-async def fetch_seating_plan(
-    username: str = Form(...),
-    password: str = Form(...),
-    captcha: str = Form(default=""),
-    session_id: str = Form(default=""),
-):
-    logger.info(f"[SEATING] Request received for user={username}")
-
-    try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            login_response = None
-            for attempt in range(3):
-                login_response = await auto_login(client, username, password)
-                if not is_login_failed(login_response):
-                    break
-                logger.warning(f"[SEATING] Login failed (attempt {attempt+1}), retrying...")
-            else:
-                logger.error("[SEATING] Login failed after 3 attempts")
-                raise HTTPException(status_code=400, detail="Invalid credentials or unable to auto-solve captcha")
-
-            logger.info("[SEATING] Login successful")
-
-            seating_plan_url = f"{BASE_URL}/index.php?r=examsection%2Fexam-invigilator-student-room-allotment-info%2Fstud_my_seating_plan"
-            logger.info(f"[SEATING] Fetching seating plan URL: {seating_plan_url}")
-
-            seating_plan_response = await client.get(seating_plan_url, headers=DEFAULT_HEADERS, timeout=30)
-
-            logger.info(f"[SEATING] Status Code: {seating_plan_response.status_code}")
-            logger.info(f"[SEATING] Final URL: {seating_plan_response.url}")
-
-            seating_plan_response.raise_for_status()
-
-            soup_sp = BeautifulSoup(seating_plan_response.text, "html.parser")
-            log_html_snippet("SEATING_PLAN_PAGE", seating_plan_response.text)
-
-            container = soup_sp.find("div", id="exam-invigilator-student-room-allotment-info-pjax")
-            if not container:
-                logger.error("[SEATING] Seating plan container not found")
-                raise HTTPException(status_code=404, detail="Could not find the seating plan container.")
-
-            table = container.find("table")
-            if not table:
-                logger.error("[SEATING] Seating plan table not found")
-                raise HTTPException(status_code=404, detail="Could not find the seating plan table.")
-
-            tbody = table.find("tbody")
-            seating_plan_data = []
-
-            for row in tbody.find_all("tr"):
-                cells = row.find_all("td")
-                if not cells or len(cells) < 8:
-                    continue
-
-                seating_plan_data.append({
-                    "date": cells[2].text.strip(),
-                    "exam_type": cells[3].text.strip(),
-                    "time_slot": cells[4].text.strip(),
-                    "admission_number": cells[5].text.strip(),
-                    "course_code": cells[6].text.strip(),
-                    "room_no": cells[7].text.strip()
-                })
-
-            if not seating_plan_data:
-                logger.warning("[SEATING] No seating plan data found")
-                raise HTTPException(status_code=404, detail="No seating plan details found.")
-
-            logger.info(f"[SEATING] Seating plan parsed successfully: {len(seating_plan_data)} entries")
-
-            return {"success": True, "seating_plan": seating_plan_data}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"[SEATING] Unexpected error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
-    finally:
-        logger.info(f"[SEATING] Session {session_id[:8]}... cleaned up.")
