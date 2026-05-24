@@ -14,33 +14,28 @@ import onnxruntime as ort
 import io
 import time
 import re
+import random
+import asyncio
 
-# ------------------ LOGGING WITH TIME SEEDS ------------------
 # ------------------ LOGGING WITH TIME SEEDS & FILE PERSISTENCE ------------------
-# Ensure the logs directory exists inside the container execution context
 os.makedirs("logs", exist_ok=True)
 
-# 1. Define the customized millisecond string format structure
 log_format_string = "%(asctime)s.%(munit)s [%(levelname)s] %(message)s"
 log_date_format = "%Y-%m-%d %H:%M:%S"
 
 log_formatter = logging.Formatter(fmt=log_format_string, datefmt=log_date_format)
 
-# 2. Console Stream Handler (For real-time streaming using 'docker logs -f')
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(log_formatter)
 
-# 3. File Handler (Writes to the volume-mapped path for storage data analysis)
 file_handler = logging.FileHandler("logs/production_api.log", mode="a", encoding="utf-8")
 file_handler.setFormatter(log_formatter)
 
-# 4. Bind handlers to the root logging engine configuration layer
 logging.basicConfig(
     level=logging.INFO,
     handlers=[console_handler, file_handler]
 )
 
-# Keep your custom millisecond factory implementation running seamlessly
 old_factory = logging.getLogRecordFactory()
 def record_factory(*args, **kwargs):
     record = old_factory(*args, **kwargs)
@@ -78,14 +73,26 @@ def solve_captcha(image_bytes: bytes) -> str:
         last = best
     return "".join(out)
 
-# ------------------ STRUCTURAL STATICS ------------------
+# ------------------ STRUCTURAL STATICS (OPTIMIZED RESIDENTIAL FINGERPRINT) ------------------
 BASE_URL = "https://newerp.kluniversity.in"
+
+CHROME_VERSIONS = ["124.0.0.0", "125.0.0.0", "126.0.0.0"]
+SELECTED_VERSION = random.choice(CHROME_VERSIONS)
+
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "User-Agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{SELECTED_VERSION} Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
     "Connection": "keep-alive",
+    "Cache-Control": "max-age=0",
+    "Sec-Ch-Ua": f'"Google Chrome";v="{SELECTED_VERSION.split(".")[0]}", "Chromium";v="{SELECTED_VERSION.split(".")[0]}", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1"
 }
 
@@ -97,7 +104,7 @@ async def lifespan(app: FastAPI):
     global limits_pool
     logger.info("✅ FastAPI app starting (Universal Concurrent Auto-Healing Engine)...")
     limits_pool = httpx.Limits(max_keepalive_connections=50, max_connections=200, keepalive_expiry=30.0)
-    logger.info("🚀 Global Concurrent Resource Pool initialized.")
+    logger.info("🚀 Global Concurrent Resource Pool initialized with HTTP/2 Overrides.")
     yield
     logger.info("🛑 Global Connection Pool safely terminated.")
 
@@ -200,21 +207,34 @@ async def _follow_redirects_collecting_cookies(
 
     return resp, current_cookies
 
-# ------------------ AUTO LOGIN (THREAD ISOLATED) ------------------
+# ------------------ AUTO LOGIN (FIREWALL BYPASS ENGINE) ------------------
 async def auto_login(client: httpx.AsyncClient, username: str, password: str, seed_cookies: dict) -> tuple[httpx.Response, dict]:
     login_url = f"{BASE_URL}/index.php?r=site%2Flogin"
     logger.info(f"[LOGIN] Running thread-isolated ONNX auto-login for user={username}")
 
-    res, step_cookies = await _follow_redirects_collecting_cookies(client, "GET", login_url, {})
+    local_headers = dict(DEFAULT_HEADERS)
+    
+    # Step 1: Initial Cold Handshake
+    res, step_cookies = await _follow_redirects_collecting_cookies(client, "GET", login_url, {}, headers=local_headers)
     res.raise_for_status()
 
     csrf = extract_csrf(res.text)
     if not csrf:
         raise Exception("CSRF token not found on login page.")
 
+    # Step 2: Mimic human browser delay processing layout
+    await asyncio.sleep(random.uniform(0.4, 0.8))
+
     dummy_data = {"_csrf": csrf, "LoginForm[username]": "", "LoginForm[password]": ""}
+    
+    local_headers["Origin"] = BASE_URL
+    local_headers["Referer"] = login_url
+    local_headers["Sec-Fetch-Site"] = "same-origin"
+    local_headers["Sec-Fetch-Mode"] = "cors"
+    local_headers["Sec-Fetch-Dest"] = "empty"
+
     res_post, step_cookies = await _follow_redirects_collecting_cookies(
-        client, "POST", login_url, step_cookies, data=dummy_data
+        client, "POST", login_url, step_cookies, data=dummy_data, headers=local_headers
     )
     res_post.raise_for_status()
 
@@ -222,15 +242,24 @@ async def auto_login(client: httpx.AsyncClient, username: str, password: str, se
     if not captcha_match:
         raise Exception("CAPTCHA image locator missing from layout.")
 
+    # Step 3: Pull Captcha Image Layer
     captcha_url = BASE_URL + captcha_match.group(1).replace("&amp;", "&")
+    
+    local_headers["Accept"] = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+    local_headers["Sec-Fetch-Mode"] = "no-cors"
+    local_headers["Sec-Fetch-Dest"] = "image"
+    local_headers["Referer"] = login_url
+
     captcha_response, step_cookies = await _follow_redirects_collecting_cookies(
-        client, "GET", captcha_url, step_cookies
+        client, "GET", captcha_url, step_cookies, headers=local_headers
     )
     captcha_response.raise_for_status()
 
+    # Step 4: Run High-Speed ONNX Calculation
     captcha_text = solve_captcha(captcha_response.content)
     logger.info(f"[LOGIN] Captcha solved: {captcha_text}")
 
+    # Step 5: Final Submission with Re-calibrated Headers
     payload = {
         "_csrf": csrf,
         "LoginForm[username]": username,
@@ -239,8 +268,17 @@ async def auto_login(client: httpx.AsyncClient, username: str, password: str, se
         "LoginForm[rememberMe]": "0",
         "LoginForm[qr_code]": "",
     }
+    
+    local_headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+    local_headers["Sec-Fetch-Mode"] = "navigate"
+    local_headers["Sec-Fetch-Dest"] = "document"
+    local_headers["Sec-Fetch-User"] = "?1"
+
+    # Anti-bot computational delay padding signature
+    await asyncio.sleep(random.uniform(0.3, 0.6))
+
     response, final_cookies = await _follow_redirects_collecting_cookies(
-        client, "POST", login_url, step_cookies, data=payload
+        client, "POST", login_url, step_cookies, data=payload, headers=local_headers
     )
     response.raise_for_status()
 
@@ -268,10 +306,14 @@ def build_register_url(base_url: str, href: str) -> str | None:
 @app.post("/login")
 async def login(username: str = Form(...), password: str = Form(...)):
     try:
-        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS) as client:
+        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS, http2=True) as client:
             login_response = None
             fresh_cookies = {}
             for attempt in range(3):
+                if attempt > 0:
+                    sleep_time = random.uniform(1.0, 2.5)
+                    logger.info(f"[LOGIN] Backoff waiting {sleep_time:.2f}s before retry context split...")
+                    await asyncio.sleep(sleep_time)
                 login_response, fresh_cookies = await auto_login(client, username, password, seed_cookies={})
                 if not is_login_failed(login_response):
                     break
@@ -326,22 +368,23 @@ async def fetch_attendance_summary(
         }
 
     try:
-        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS) as client:
+        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS, http2=True) as client:
 
             if not php_sess_id or not csrf_cookie:
                 logger.info(f"[ATTENDANCE] No session cookies — running cold-start auto-login for {username}")
                 for attempt in range(3):
+                    if attempt > 0:
+                        sleep_time = random.uniform(1.0, 2.5)
+                        logger.info(f"[LOGIN] Backoff waiting {sleep_time:.2f}s before retry...")
+                        await asyncio.sleep(sleep_time)
                     login_response, cookie_jar = await auto_login(client, username, password, seed_cookies={})
                     if not is_login_failed(login_response):
                         break
                 else:
                     raise HTTPException(status_code=401, detail="Cold-start login failed. Check credentials.")
                 php_sess_id = cookie_jar.get("PHPSESSID", "")
-                # Use CSRF from the post-login landing page (already a valid page-level CSRF)
                 page_csrf = extract_csrf(login_response.text)
             else:
-                # GET the attendance landing page (accepts GET) to extract a fresh page-level CSRF.
-                # Do NOT GET the courselist URL — it is POST-only and returns 400 on GET.
                 attendance_landing = f"{BASE_URL}/index.php?r=studentattendance%2Fstudentdailyattendance"
                 logger.info(f"[ATTENDANCE] GET landing page for fresh CSRF (PHPSESSID={php_sess_id[:6]}...)")
                 get_response, cookie_jar = await _follow_redirects_collecting_cookies(
@@ -351,6 +394,8 @@ async def fetch_attendance_summary(
                 if is_login_failed(get_response):
                     logger.warning("[ATTENDANCE] Session expired on GET. Running auto-healer...")
                     for attempt in range(3):
+                        if attempt > 0:
+                            await asyncio.sleep(random.uniform(1.0, 2.0))
                         login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
                         if not is_login_failed(login_response):
                             break
@@ -365,7 +410,6 @@ async def fetch_attendance_summary(
 
             logger.info(f"[ATTENDANCE] Fresh CSRF extracted. Submitting POST to courselist...")
 
-            # POST to courselist with the freshly extracted page-level CSRF
             post_response, cookie_jar = await _follow_redirects_collecting_cookies(
                 client, "POST", attendance_url, cookie_jar, timeout=15,
                 data=_make_payload(page_csrf)
@@ -374,6 +418,8 @@ async def fetch_attendance_summary(
             if is_login_failed(post_response):
                 logger.warning("[ATTENDANCE] Session expired on POST. Running auto-healer...")
                 for attempt in range(3):
+                    if attempt > 0:
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
                     login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
                     if not is_login_failed(login_response):
                         break
@@ -391,8 +437,6 @@ async def fetch_attendance_summary(
 
             post_response.raise_for_status()
             html_content = post_response.text
-
-
 
         table_match = re.search(r'<table.*?>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
         if not table_match:
@@ -474,10 +518,12 @@ async def fetch_register_detail(
     }
 
     try:
-        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS) as client:
+        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS, http2=True) as client:
             if not php_sess_id or not csrf_cookie:
                 logger.info(f"[LAZY-REGISTER] Cold-start auto-login for {username}")
                 for attempt in range(3):
+                    if attempt > 0:
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
                     login_response, cookie_jar = await auto_login(client, username, password, seed_cookies={})
                     if not is_login_failed(login_response):
                         break
@@ -494,6 +540,8 @@ async def fetch_register_detail(
             if response.status_code == 500 or is_login_failed(response):
                 logger.warning("[LAZY-REGISTER] Session invalid. Auto-healing context stream...")
                 for attempt in range(3):
+                    if attempt > 0:
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
                     login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
                     if not is_login_failed(login_response):
                         break
@@ -581,10 +629,12 @@ async def fetch_seating_plan(
     seating_plan_url = f"{BASE_URL}/index.php?r=examsection%2Fexam-invigilator-student-room-allotment-info%2Fstud_my_seating_plan"
 
     try:
-        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS) as client:
+        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS, http2=True) as client:
             if not php_sess_id or not csrf_cookie:
                 logger.info(f"[SEATING] Cold-start auto-login for {username}")
                 for attempt in range(3):
+                    if attempt > 0:
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
                     login_response, cookie_jar = await auto_login(client, username, password, seed_cookies={})
                     if not is_login_failed(login_response):
                         break
@@ -597,6 +647,8 @@ async def fetch_seating_plan(
             if response.status_code == 500 or is_login_failed(response):
                 logger.warning("[SEATING] Session invalid. Executing tracking fallback...")
                 for attempt in range(3):
+                    if attempt > 0:
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
                     login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
                     if not is_login_failed(login_response):
                         break
@@ -682,10 +734,12 @@ async def fetch_timetable(
     )
 
     try:
-        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS) as client:
+        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS, http2=True) as client:
             if not php_sess_id or not csrf_cookie:
                 logger.info(f"[TIMETABLE] Cold-start auto-login for {username}")
                 for attempt in range(3):
+                    if attempt > 0:
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
                     login_response, cookie_jar = await auto_login(client, username, password, seed_cookies={})
                     if not is_login_failed(login_response):
                         break
@@ -698,6 +752,8 @@ async def fetch_timetable(
             if response.status_code == 500 or is_login_failed(response):
                 logger.warning("[TIMETABLE] Session invalid. Executing automated auto-healing...")
                 for attempt in range(3):
+                    if attempt > 0:
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
                     login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
                     if not is_login_failed(login_response):
                         break
