@@ -784,7 +784,7 @@ async def fetch_timetable(
                 for attempt in range(3):
                     if attempt > 0:
                         await asyncio.sleep(random.uniform(1.0, 2.0))
-                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies={mo_cookie_jar := cookie_jar})
+                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
                     if not is_login_failed(login_response):
                         break
                 else:
