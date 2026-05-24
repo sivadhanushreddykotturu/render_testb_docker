@@ -335,6 +335,12 @@ async def login(username: str = Form(...), password: str = Form(...)):
             }
     except HTTPException:
         raise
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException) as net_err:
+        logger.error(f"[NETWORK REJECTION] /login - University gateway down: {net_err}")
+        raise HTTPException(
+            status_code=503, 
+            detail="University ERP portal is down or under maintenance. Please try again later."
+        )
     except Exception as e:
         logger.error(f"[LOGIN_ROUTE] Exception: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal processing fault during authorization sync.")
@@ -490,6 +496,14 @@ async def fetch_attendance_summary(
             },
             "attendance": attendance_data
         }
+    except HTTPException:
+        raise
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException) as net_err:
+        logger.error(f"[NETWORK REJECTION] /fetch-attendance - University gateway down: {net_err}")
+        raise HTTPException(
+            status_code=503, 
+            detail="University ERP portal is down or under maintenance. Please try again later."
+        )
     except Exception as e:
         logger.error(f"[ATTENDANCE] Crash: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -605,6 +619,14 @@ async def fetch_register_detail(
             "metadata": metadata,
             "daily_attendance": daily_attendance
         }
+    except HTTPException:
+        raise
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException) as net_err:
+        logger.error(f"[NETWORK REJECTION] /fetch-register-detail - University gateway down: {net_err}")
+        raise HTTPException(
+            status_code=503, 
+            detail="University ERP portal is down or under maintenance. Please try again later."
+        )
     except Exception as e:
         logger.error(f"[REGISTER] Crash: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -704,6 +726,14 @@ async def fetch_seating_plan(
             },
             "seating_plan": seating_plan_data
         }
+    except HTTPException:
+        raise
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException) as net_err:
+        logger.error(f"[NETWORK REJECTION] /fetch-seating-plan - University gateway down: {net_err}")
+        raise HTTPException(
+            status_code=503, 
+            detail="University ERP portal is down or under maintenance. Please try again later."
+        )
     except Exception as e:
         logger.error(f"[SEATING] Crash: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -754,7 +784,7 @@ async def fetch_timetable(
                 for attempt in range(3):
                     if attempt > 0:
                         await asyncio.sleep(random.uniform(1.0, 2.0))
-                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
+                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies={mo_cookie_jar := cookie_jar})
                     if not is_login_failed(login_response):
                         break
                 else:
@@ -809,6 +839,14 @@ async def fetch_timetable(
             },
             "timetable": timetable_data
         }
+    except HTTPException:
+        raise
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException) as net_err:
+        logger.error(f"[NETWORK REJECTION] /fetch-timetable - University gateway down: {net_err}")
+        raise HTTPException(
+            status_code=503, 
+            detail="University ERP portal is down or under maintenance. Please try again later."
+        )
     except Exception as e:
         logger.error(f"[TIMETABLE] Crash: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
