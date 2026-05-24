@@ -551,8 +551,8 @@ async def fetch_register_detail(
             register_url_with_csrf = f"{register_url}&_csrf={active_csrf}"
             response = await client.get(register_url_with_csrf, cookies=cookie_jar, timeout=15)
 
-            if response.status_code == 500 or is_login_failed(response):
-                logger.warning("[LAZY-REGISTER] Session invalid. Auto-healing context stream...")
+            if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
+                logger.warning("[LAZY-REGISTER] Session invalid or redirected (302). Auto-healing context stream...")
                 for attempt in range(3):
                     if attempt > 0:
                         await asyncio.sleep(random.uniform(1.0, 2.0))
@@ -666,8 +666,8 @@ async def fetch_seating_plan(
 
             response = await client.get(seating_plan_url, cookies=cookie_jar, timeout=15)
 
-            if response.status_code == 500 or is_login_failed(response):
-                logger.warning("[SEATING] Session invalid. Executing tracking fallback...")
+            if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
+                logger.warning("[SEATING] Session invalid or redirected (302). Executing tracking fallback...")
                 for attempt in range(3):
                     if attempt > 0:
                         await asyncio.sleep(random.uniform(1.0, 2.0))
@@ -779,8 +779,8 @@ async def fetch_timetable(
 
             response = await client.get(tt_url, cookies=cookie_jar, timeout=12)
 
-            if response.status_code == 500 or is_login_failed(response):
-                logger.warning("[TIMETABLE] Session invalid. Executing automated auto-healing...")
+            if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
+                logger.warning("[TIMETABLE] Session invalid or redirected (302). Executing automated auto-healing...")
                 for attempt in range(3):
                     if attempt > 0:
                         await asyncio.sleep(random.uniform(1.0, 2.0))
