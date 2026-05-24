@@ -1,4 +1,6 @@
-from fastapi import FastAPI, Form, HTTPException
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import httpx
@@ -13,6 +15,22 @@ import io
 import time
 import re
 
+# ------------------ LOGGING WITH TIME SEEDS ------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s.%(munit)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+old_factory = logging.getLogRecordFactory()
+def record_factory(*args, **kwargs):
+    record = old_factory(*args, **kwargs)
+    record.munit = f"{int(record.msecs):03d}"
+    return record
+logging.setLogRecordFactory(record_factory)
+
+logger = logging.getLogger(__name__)
+
 # ------------------ CAPTCHA SOLVER INIT ------------------
 try:
     with open("model/crnn.json", "r") as f:
@@ -22,7 +40,7 @@ try:
     _captcha_img_h = _captcha_meta["img_h"]
     _captcha_session = ort.InferenceSession("model/crnn.onnx")
 except Exception as e:
-    print(f"Warning: Failed to load captcha model: {e}")
+    logger.error(f"Warning: Failed to load captcha model: {e}")
 
 def solve_captcha(image_bytes: bytes) -> str:
     img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
@@ -41,10 +59,6 @@ def solve_captcha(image_bytes: bytes) -> str:
         last = best
     return "".join(out)
 
-# ------------------ LOGGING ------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 # ------------------ STRUCTURAL STATICS ------------------
 BASE_URL = "https://newerp.kluniversity.in"
 DEFAULT_HEADERS = {
@@ -57,7 +71,6 @@ DEFAULT_HEADERS = {
 }
 
 # ------------------ GLOBAL CONNECTION LIFESPAN ------------------
-# We use an httpx.AsyncLimits pool to back individual isolated client frames natively.
 limits_pool = None
 
 @asynccontextmanager
@@ -69,7 +82,7 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("🛑 Global Connection Pool safely terminated.")
 
-app = FastAPI(title="TimeTable & Attendance Backend", version="7.3.0", lifespan=lifespan)
+app = FastAPI(title="TimeTable & Attendance Backend", version="7.5.0", lifespan=lifespan)
 
 # ------------------ CORS ------------------
 app.add_middleware(
@@ -79,6 +92,18 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["X-Session-ID"],
 )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.error(f"422 Validation Error on {request.url.path}. Errors: {exc.errors()}")
+    return JSONResponse(
+        status_code=422,
+        content={
+            "success": False, 
+            "message": "App version outdated. Please clear cache and refresh the page to update.", 
+            "detail": "App version outdated. Please clear cache and refresh the page to update."
+        },
+    )
 
 # ------------------ HEALTH ------------------
 @app.get("/")
@@ -120,10 +145,6 @@ def collect_cookies(response: httpx.Response, base: dict) -> dict:
 async def _follow_redirects_collecting_cookies(
     client: httpx.AsyncClient, method: str, url: str, step_cookies: dict, timeout: int = 30, **kwargs
 ) -> tuple[httpx.Response, dict]:
-    """
-    THREAD-SAFE COURIER: Executes manual tracking utilizing isolated client 
-    contexts passed directly from specific invocation runtimes.
-    """
     current_url = url
     current_cookies = dict(step_cookies)
     max_redirects = 10
@@ -246,7 +267,8 @@ async def login(username: str = Form(...), password: str = Form(...)):
                     "PHPSESSID": fresh_cookies.get("PHPSESSID"),
                     "kl_erp_device_id": fresh_cookies.get("kl_erp_device_id"),
                     "SERVERID": fresh_cookies.get("SERVERID", "erp3"),
-                    "_csrf_token": fresh_csrf
+                    "_csrf_token": fresh_csrf,
+                    "_csrf": fresh_csrf
                 }
             }
     except HTTPException:
@@ -260,18 +282,18 @@ async def login(username: str = Form(...), password: str = Form(...)):
 async def fetch_attendance_summary(
     username: str = Form(...),
     password: str = Form(...),
-    php_sess_id: str = Form(...),
-    csrf_cookie: str = Form(...),
-    device_id: str = Form(...),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
     server_id: str = Form(default="erp3"),
     academic_year_code: str = Form(...),
     semester_id: str = Form(...)
 ):
     start_time = time.time()
     cookie_jar = {
-        "_csrf": unquote(csrf_cookie),
+        "_csrf": unquote(csrf_cookie) if csrf_cookie else "",
         "PHPSESSID": php_sess_id,
-        "kl_erp_device_id": unquote(device_id),
+        "kl_erp_device_id": unquote(device_id) if device_id else "",
         "SERVERID": server_id
     }
     attendance_url = f"{BASE_URL}/index.php?r=studentattendance%2Fstudentdailyattendance%2Fcourselist"
@@ -285,14 +307,52 @@ async def fetch_attendance_summary(
 
     try:
         async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS) as client:
-            logger.info(f"[ATTENDANCE] Isolated POST query initialization (PHPSESSID={php_sess_id[:6]}...)")
+
+            if not php_sess_id or not csrf_cookie:
+                logger.info(f"[ATTENDANCE] No session cookies — running cold-start auto-login for {username}")
+                for attempt in range(3):
+                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies={})
+                    if not is_login_failed(login_response):
+                        break
+                else:
+                    raise HTTPException(status_code=401, detail="Cold-start login failed. Check credentials.")
+                php_sess_id = cookie_jar.get("PHPSESSID", "")
+                # Use CSRF from the post-login landing page (already a valid page-level CSRF)
+                page_csrf = extract_csrf(login_response.text)
+            else:
+                # GET the attendance landing page (accepts GET) to extract a fresh page-level CSRF.
+                # Do NOT GET the courselist URL — it is POST-only and returns 400 on GET.
+                attendance_landing = f"{BASE_URL}/index.php?r=studentattendance%2Fstudentdailyattendance"
+                logger.info(f"[ATTENDANCE] GET landing page for fresh CSRF (PHPSESSID={php_sess_id[:6]}...)")
+                get_response, cookie_jar = await _follow_redirects_collecting_cookies(
+                    client, "GET", attendance_landing, cookie_jar, timeout=15
+                )
+
+                if is_login_failed(get_response):
+                    logger.warning("[ATTENDANCE] Session expired on GET. Running auto-healer...")
+                    for attempt in range(3):
+                        login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
+                        if not is_login_failed(login_response):
+                            break
+                    else:
+                        raise HTTPException(status_code=401, detail="ERP system rejected fallback login.")
+                    page_csrf = extract_csrf(login_response.text)
+                else:
+                    page_csrf = extract_csrf(get_response.text)
+
+            if not page_csrf:
+                raise HTTPException(status_code=500, detail="Could not extract CSRF token from attendance page.")
+
+            logger.info(f"[ATTENDANCE] Fresh CSRF extracted. Submitting POST to courselist...")
+
+            # POST to courselist with the freshly extracted page-level CSRF
             post_response, cookie_jar = await _follow_redirects_collecting_cookies(
                 client, "POST", attendance_url, cookie_jar, timeout=15,
-                data=_make_payload(unquote(csrf_cookie))
+                data=_make_payload(page_csrf)
             )
 
             if is_login_failed(post_response):
-                logger.warning("[ATTENDANCE] Session expired. Running automatic fallback healer...")
+                logger.warning("[ATTENDANCE] Session expired on POST. Running auto-healer...")
                 for attempt in range(3):
                     login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
                     if not is_login_failed(login_response):
@@ -300,17 +360,19 @@ async def fetch_attendance_summary(
                 else:
                     raise HTTPException(status_code=401, detail="ERP system rejected fallback login.")
 
-                fresh_csrf = extract_csrf(login_response.text)
-                if not fresh_csrf:
+                page_csrf = extract_csrf(login_response.text)
+                if not page_csrf:
                     raise HTTPException(status_code=500, detail="Could not reconcile session CSRF signatures.")
 
                 post_response, cookie_jar = await _follow_redirects_collecting_cookies(
                     client, "POST", attendance_url, cookie_jar, timeout=15,
-                    data=_make_payload(fresh_csrf)
+                    data=_make_payload(page_csrf)
                 )
 
             post_response.raise_for_status()
             html_content = post_response.text
+
+
 
         table_match = re.search(r'<table.*?>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
         if not table_match:
@@ -349,16 +411,18 @@ async def fetch_attendance_summary(
 
         updated_session_id = cookie_jar.get("PHPSESSID")
         has_refreshed = updated_session_id != php_sess_id
+        final_csrf = cookie_jar.get("_csrf", page_csrf)
 
+        logger.info(f"[ATTENDANCE] Fetch loop successful. Refreshed Status: {has_refreshed} in {time.time() - start_time:.3f}s")
         return {
             "success": True,
             "session_refreshed": has_refreshed,
             "cookies": {
                 "PHPSESSID": updated_session_id,
-                "_csrf_token": cookie_jar.get("_csrf"),
-                "_csrf": cookie_jar.get("_csrf"),
                 "kl_erp_device_id": cookie_jar.get("kl_erp_device_id", device_id),
-                "SERVERID": cookie_jar.get("SERVERID", server_id)
+                "SERVERID": cookie_jar.get("SERVERID", server_id),
+                "_csrf_token": final_csrf,
+                "_csrf": final_csrf
             },
             "attendance": attendance_data
         }
@@ -371,26 +435,40 @@ async def fetch_attendance_summary(
 async def fetch_register_detail(
     username: str = Form(...),
     password: str = Form(...),
-    php_sess_id: str = Form(...),
-    csrf_cookie: str = Form(...),
-    device_id: str = Form(...),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
     server_id: str = Form(default="erp3"),
     register_href: str = Form(...)
 ):
+    start_time = time.time()
     register_url = build_register_url(BASE_URL, register_href)
     if not register_url:
         raise HTTPException(status_code=400, detail="Target path failure.")
 
     cookie_jar = {
-        "_csrf": unquote(csrf_cookie),
+        "_csrf": unquote(csrf_cookie) if csrf_cookie else "",
         "PHPSESSID": php_sess_id,
-        "kl_erp_device_id": unquote(device_id),
+        "kl_erp_device_id": unquote(device_id) if device_id else "",
         "SERVERID": server_id
     }
 
     try:
         async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS) as client:
-            register_url_with_csrf = f"{register_url}&_csrf={unquote(csrf_cookie)}"
+            if not php_sess_id or not csrf_cookie:
+                logger.info(f"[LAZY-REGISTER] Cold-start auto-login for {username}")
+                for attempt in range(3):
+                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies={})
+                    if not is_login_failed(login_response):
+                        break
+                else:
+                    raise HTTPException(status_code=401, detail="Cold-start login failed. Check credentials.")
+                active_csrf = extract_csrf(login_response.text)
+                php_sess_id = cookie_jar.get("PHPSESSID", "")
+            else:
+                active_csrf = unquote(csrf_cookie)
+
+            register_url_with_csrf = f"{register_url}&_csrf={active_csrf}"
             response = await client.get(register_url_with_csrf, cookies=cookie_jar, timeout=15)
 
             if response.status_code == 500 or is_login_failed(response):
@@ -402,8 +480,8 @@ async def fetch_register_detail(
                 else:
                     raise HTTPException(status_code=401, detail="Authentication credentials expired.")
 
-                fresh_csrf = extract_csrf(login_response.text) or cookie_jar.get("_csrf", "")
-                register_url_with_csrf = f"{register_url}&_csrf={fresh_csrf}"
+                active_csrf = extract_csrf(login_response.text) or cookie_jar.get("_csrf", "")
+                register_url_with_csrf = f"{register_url}&_csrf={active_csrf}"
                 response = await client.get(register_url_with_csrf, cookies=cookie_jar, timeout=15)
 
             response.raise_for_status()
@@ -443,20 +521,24 @@ async def fetch_register_detail(
 
         updated_session_id = cookie_jar.get("PHPSESSID")
         has_refreshed = updated_session_id != php_sess_id
+        final_csrf = cookie_jar.get("_csrf", active_csrf)
 
+        logger.info(f"[LAZY-REGISTER] Register loop complete. Refreshed Status: {has_refreshed} in {time.time() - start_time:.3f}s")
         return {
             "success": True,
             "session_refreshed": has_refreshed,
             "cookies": {
                 "PHPSESSID": updated_session_id,
-                "_csrf": cookie_jar.get("_csrf"),
                 "kl_erp_device_id": cookie_jar.get("kl_erp_device_id", device_id),
-                "SERVERID": cookie_jar.get("SERVERID", server_id)
-            } if has_refreshed else {},
+                "SERVERID": cookie_jar.get("SERVERID", server_id),
+                "_csrf_token": final_csrf,
+                "_csrf": final_csrf
+            },
             "metadata": metadata,
             "daily_attendance": daily_attendance
         }
     except Exception as e:
+        logger.error(f"[REGISTER] Crash: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 # ------------------ FETCH SEATING PLAN ------------------
@@ -464,21 +546,32 @@ async def fetch_register_detail(
 async def fetch_seating_plan(
     username: str = Form(...),
     password: str = Form(...),
-    php_sess_id: str = Form(...),
-    csrf_cookie: str = Form(...),
-    device_id: str = Form(...),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
     server_id: str = Form(default="erp3")
 ):
+    start_time = time.time()
     cookie_jar = {
-        "_csrf": unquote(csrf_cookie),
+        "_csrf": unquote(csrf_cookie) if csrf_cookie else "",
         "PHPSESSID": php_sess_id,
-        "kl_erp_device_id": unquote(device_id),
+        "kl_erp_device_id": unquote(device_id) if device_id else "",
         "SERVERID": server_id
     }
     seating_plan_url = f"{BASE_URL}/index.php?r=examsection%2Fexam-invigilator-student-room-allotment-info%2Fstud_my_seating_plan"
 
     try:
         async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS) as client:
+            if not php_sess_id or not csrf_cookie:
+                logger.info(f"[SEATING] Cold-start auto-login for {username}")
+                for attempt in range(3):
+                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies={})
+                    if not is_login_failed(login_response):
+                        break
+                else:
+                    raise HTTPException(status_code=401, detail="Cold-start login failed. Check credentials.")
+                php_sess_id = cookie_jar.get("PHPSESSID", "")
+
             response = await client.get(seating_plan_url, cookies=cookie_jar, timeout=15)
 
             if response.status_code == 500 or is_login_failed(response):
@@ -524,19 +617,23 @@ async def fetch_seating_plan(
 
         updated_session_id = cookie_jar.get("PHPSESSID")
         has_refreshed = updated_session_id != php_sess_id
+        final_csrf = cookie_jar.get("_csrf", unquote(csrf_cookie) if csrf_cookie else "")
 
+        logger.info(f"[SEATING] Seating plan loop complete. Refreshed Status: {has_refreshed} in {time.time() - start_time:.3f}s")
         return {
             "success": True,
             "session_refreshed": has_refreshed,
             "cookies": {
                 "PHPSESSID": updated_session_id,
-                "_csrf": cookie_jar.get("_csrf"),
                 "kl_erp_device_id": cookie_jar.get("kl_erp_device_id", device_id),
-                "SERVERID": cookie_jar.get("SERVERID", server_id)
-            } if has_refreshed else {},
+                "SERVERID": cookie_jar.get("SERVERID", server_id),
+                "_csrf_token": final_csrf,
+                "_csrf": final_csrf
+            },
             "seating_plan": seating_plan_data
         }
     except Exception as e:
+        logger.error(f"[SEATING] Crash: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 # ------------------ FETCH TIMETABLE ------------------
@@ -544,17 +641,18 @@ async def fetch_seating_plan(
 async def fetch_timetable(
     username: str = Form(...),
     password: str = Form(...),
-    php_sess_id: str = Form(...),
-    csrf_cookie: str = Form(...),
-    device_id: str = Form(...),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
     server_id: str = Form(default="erp3"),
     academic_year_code: str = Form(default="19"),
     semester_id: str = Form(default="1")
 ):
+    start_time = time.time()
     cookie_jar = {
-        "_csrf": unquote(csrf_cookie),
+        "_csrf": unquote(csrf_cookie) if csrf_cookie else "",
         "PHPSESSID": php_sess_id,
-        "kl_erp_device_id": unquote(device_id),
+        "kl_erp_device_id": unquote(device_id) if device_id else "",
         "SERVERID": server_id
     }
     tt_url = (
@@ -565,6 +663,16 @@ async def fetch_timetable(
 
     try:
         async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS) as client:
+            if not php_sess_id or not csrf_cookie:
+                logger.info(f"[TIMETABLE] Cold-start auto-login for {username}")
+                for attempt in range(3):
+                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies={})
+                    if not is_login_failed(login_response):
+                        break
+                else:
+                    raise HTTPException(status_code=401, detail="Cold-start login failed. Check credentials.")
+                php_sess_id = cookie_jar.get("PHPSESSID", "")
+
             response = await client.get(tt_url, cookies=cookie_jar, timeout=12)
 
             if response.status_code == 500 or is_login_failed(response):
@@ -610,19 +718,23 @@ async def fetch_timetable(
 
         updated_session_id = cookie_jar.get("PHPSESSID")
         has_refreshed = updated_session_id != php_sess_id
+        final_csrf = cookie_jar.get("_csrf", unquote(csrf_cookie) if csrf_cookie else "")
 
+        logger.info(f"[TIMETABLE] Timetable loop complete. Refreshed Status: {has_refreshed} in {time.time() - start_time:.3f}s")
         return {
             "success": True,
             "session_refreshed": has_refreshed,
             "cookies": {
                 "PHPSESSID": updated_session_id,
-                "_csrf": cookie_jar.get("_csrf"),
                 "kl_erp_device_id": cookie_jar.get("kl_erp_device_id", device_id),
-                "SERVERID": cookie_jar.get("SERVERID", server_id)
-            } if has_refreshed else {},
+                "SERVERID": cookie_jar.get("SERVERID", server_id),
+                "_csrf_token": final_csrf,
+                "_csrf": final_csrf
+            },
             "timetable": timetable_data
         }
     except Exception as e:
+        logger.error(f"[TIMETABLE] Crash: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 # ------------------ GITHUB COMMIT ROUTE ------------------
