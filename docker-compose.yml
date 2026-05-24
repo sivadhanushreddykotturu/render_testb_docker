@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  api_backend:
+    build: .
+    container_name: university_api_prod
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - ENV=production
+    # 📝 Persistent volume mapping to save log files on your host drive
+    volumes:
+      - ./server_logs:/code/logs
+    # 🔄 Native Docker log-rotation to prevent disk space bloat
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m" # Automatically rolls over after hitting 10MB
+        max-file: "5" # Retains a maximum history of 5 files (Caps logs at 50MB)

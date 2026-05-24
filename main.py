@@ -16,12 +16,31 @@ import time
 import re
 
 # ------------------ LOGGING WITH TIME SEEDS ------------------
+# ------------------ LOGGING WITH TIME SEEDS & FILE PERSISTENCE ------------------
+# Ensure the logs directory exists inside the container execution context
+os.makedirs("logs", exist_ok=True)
+
+# 1. Define the customized millisecond string format structure
+log_format_string = "%(asctime)s.%(munit)s [%(levelname)s] %(message)s"
+log_date_format = "%Y-%m-%d %H:%M:%S"
+
+log_formatter = logging.Formatter(fmt=log_format_string, datefmt=log_date_format)
+
+# 2. Console Stream Handler (For real-time streaming using 'docker logs -f')
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+
+# 3. File Handler (Writes to the volume-mapped path for storage data analysis)
+file_handler = logging.FileHandler("logs/production_api.log", mode="a", encoding="utf-8")
+file_handler.setFormatter(log_formatter)
+
+# 4. Bind handlers to the root logging engine configuration layer
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s.%(munit)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    handlers=[console_handler, file_handler]
 )
 
+# Keep your custom millisecond factory implementation running seamlessly
 old_factory = logging.getLogRecordFactory()
 def record_factory(*args, **kwargs):
     record = old_factory(*args, **kwargs)
@@ -95,7 +114,8 @@ app.add_middleware(
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    logger.error(f"422 Validation Error on {request.url.path}. Errors: {exc.errors()}")
+    body = await request.body()
+    logger.error(f"422 Validation Error on {request.url.path}. Body: {body.decode('utf-8', 'ignore')}. Errors: {exc.errors()}")
     return JSONResponse(
         status_code=422,
         content={
@@ -736,44 +756,3 @@ async def fetch_timetable(
     except Exception as e:
         logger.error(f"[TIMETABLE] Crash: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
-# ------------------ GITHUB COMMIT ROUTE ------------------
-OWNER = "sivadhanushreddykotturu"
-REPO = "TimeTablekl"
-_cached_commit = None
-_last_fetch_time = 0
-CACHE_TTL = 300
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-
-@app.get("/latest-commit")
-async def latest_commit():
-    global _cached_commit, _last_fetch_time
-
-    if _cached_commit and (time.time() - _last_fetch_time < CACHE_TTL):
-        return {**_cached_commit, "cached": True}
-
-    url = f"https://api.github.com/repos/{OWNER}/{REPO}/commits"
-    headers = {"Accept": "application/vnd.github+json"}
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, headers=headers, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-
-        commit = data[0]
-        latest = {
-            "author": commit["commit"]["author"]["name"],
-            "message": commit["commit"]["message"],
-            "avatar": commit["author"]["avatar_url"] if commit.get("author") else None,
-            "url": commit["html_url"],
-            "date": commit["commit"]["author"]["date"],
-        }
-
-        _cached_commit = latest
-        _last_fetch_time = time.time()
-        return {**latest, "cached": False}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
