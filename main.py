@@ -16,6 +16,7 @@ import time
 import re
 import random
 import asyncio
+from bs4 import BeautifulSoup
 
 # ------------------ LOGGING WITH TIME SEEDS & FILE PERSISTENCE ------------------
 os.makedirs("logs", exist_ok=True)
@@ -849,4 +850,207 @@ async def fetch_timetable(
         )
     except Exception as e:
         logger.error(f"[TIMETABLE] Crash: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/fetch-cgpa")
+async def fetch_cgpa_summary(
+    username: str = Form(...),
+    password: str = Form(...),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
+    server_id: str = Form(default="erp1")
+):
+    start_time = time.time()
+    cookie_jar = {
+        "_csrf": unquote(csrf_cookie) if csrf_cookie else "",
+        "PHPSESSID": php_sess_id,
+        "kl_erp_device_id": unquote(device_id) if device_id else "",
+        "SERVERID": server_id
+    }
+    cgpa_url = f"{BASE_URL}/index.php?r=studentinfo%2Fstudentendexamresult%2Fsearchgetmycgpa"
+
+    try:
+        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS, http2=True) as client:
+            if not php_sess_id or not csrf_cookie:
+                logger.info(f"[CGPA] Cold start authentication trigger for {username}")
+                for attempt in range(3):
+                    if attempt > 0:
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
+                    res, cookie_jar = await auto_login(client, username, password, seed_cookies={})
+                    if not is_login_failed(res):
+                        break
+                else:
+                    raise HTTPException(status_code=401, detail="Authentication initialization failed.")
+                php_sess_id = cookie_jar.get("PHPSESSID", "")
+
+            response = await client.get(cgpa_url, cookies=cookie_jar, timeout=15)
+
+            if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
+                logger.warning("[CGPA] Session handshake dropped. Executing auto-heal retry routine...")
+                for attempt in range(3):
+                    if attempt > 0:
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
+                    res, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
+                    if not is_login_failed(res):
+                        break
+                else:
+                    raise HTTPException(status_code=401, detail="Gateway authentication dropped permanently.")
+
+                response = await client.get(cgpa_url, cookies=cookie_jar, timeout=15)
+
+            response.raise_for_status()
+            html_content = response.text
+
+        # Locate the core container table via regex
+        # --- Corrected Pure Regex Parser Matrix ---
+        table_match = re.search(r'<table.*?>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
+        if not table_match:
+            raise HTTPException(status_code=404, detail="Academic performance summary grid layout missing.")
+
+        table_body = table_match.group(1)
+        rows = re.findall(r'<tr.*?>(.*?)</tr>', table_body, re.DOTALL | re.IGNORECASE)
+        
+        courses_history_list = []
+        for row in rows:
+            if "<th" in row.lower():
+                continue
+                
+            cells = re.findall(r'<td.*?>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
+            # Safe boundary check: we need at least 11 columns to parse the cells array safely
+            if len(cells) < 11:
+                continue
+
+            # Capture dynamic encrypted validation lookup reference parameters
+            link_match = re.search(r'href=["\']([^"\']+)["\']', row, re.IGNORECASE)
+            raw_href = link_match.group(1).replace("&amp;", "&") if link_match else ""
+
+            # Explicit column mappings based on actual ERP layout indexes
+            courses_history_list.append({
+                "course_code": re.sub(r'<.*?>', '', cells[3]).strip(),          # Col 3: 22UC0021
+                "course_name": re.sub(r'<.*?>', '', cells[4]).strip(),          # Col 4: SOCIAL IMMERSIVE LEARNING-1
+                "grade": re.sub(r'<.*?>', '', cells[5]).strip(),                # Col 5: O
+                "grade_point": re.sub(r'<.*?>', '', cells[6]).strip(),          # Col 6: 10
+                "credits": re.sub(r'<.*?>', '', cells[7]).strip(),              # Col 7: 1
+                "promotion_status": re.sub(r'<.*?>', '', cells[8]).strip(),     # Col 8: P
+                "academic_year": re.sub(r'<.*?>', '', cells[9]).strip(),        # Col 9: 2024-2025
+                "semester": re.sub(r'<.*?>', '', cells[10]).strip(),            # Col 10: Even Sem
+                "target_href": raw_href                                         # Extraction dynamic link path
+            })
+
+
+        updated_session_id = cookie_jar.get("PHPSESSID")
+        has_refreshed = updated_session_id != php_sess_id
+        final_csrf = cookie_jar.get("_csrf", unquote(csrf_cookie) if csrf_cookie else "")
+
+        logger.info(f"[CGPA] Successfully structured course array layout. Refreshed: {has_refreshed} in {time.time() - start_time:.3f}s")
+        return {
+            "success": True,
+            "session_refreshed": has_refreshed,
+            "cookies": {
+                "PHPSESSID": updated_session_id,
+                "kl_erp_device_id": cookie_jar.get("kl_erp_device_id", device_id),
+                "SERVERID": cookie_jar.get("SERVERID", server_id),
+                "_csrf_token": final_csrf,
+                "_csrf": final_csrf
+            },
+            "data": courses_history_list
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[CGPA ERROR] Processing sequence crashed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/fetch-marks-detail")
+async def fetch_marks_detail(
+    target_href: str = Form(...),
+    username: str = Form(...),
+    password: str = Form(...),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
+    server_id: str = Form(default="erp1")
+):
+    start_time = time.time()
+    cookie_jar = {
+        "_csrf": unquote(csrf_cookie) if csrf_cookie else "",
+        "PHPSESSID": php_sess_id,
+        "kl_erp_device_id": unquote(device_id) if device_id else "",
+        "SERVERID": server_id
+    }
+    
+    if target_href.startswith("http"):
+        full_detail_url = target_href
+    else:
+        full_detail_url = f"{BASE_URL}/{target_href.lstrip('/')}"
+
+    try:
+        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS, http2=True) as client:
+            response = await client.get(full_detail_url, cookies=cookie_jar, timeout=15)
+
+            if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
+                logger.warning("[MARKS DETAIL] Token expired. Launching auto-login fallback...")
+                for attempt in range(3):
+                    if attempt > 0:
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
+                    res, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
+                    if not is_login_failed(res):
+                        break
+                else:
+                    raise HTTPException(status_code=401, detail="Session verification recovery rejected.")
+
+                response = await client.get(full_detail_url, cookies=cookie_jar, timeout=15)
+
+            response.raise_for_status()
+            html_content = response.text
+
+        # Extract rows using matching id markers
+        detail_table_match = re.search(r'<table id="w0".*?>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
+        if not detail_table_match:
+            raise HTTPException(status_code=404, detail="Consolidated detailed scorecard layout missing.")
+
+        detail_body = detail_table_match.group(1)
+        detail_rows = re.findall(r'<tr.*?>(.*?)</tr>', detail_body, re.DOTALL | re.IGNORECASE)
+
+        marks_map = {}
+        for row in detail_rows:
+            th_match = re.search(r'<th.*?>(.*?)</th>', row, re.DOTALL | re.IGNORECASE)
+            td_match = re.search(r'<td.*?>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
+            
+            if th_match and td_match:
+                raw_key = re.sub(r'<.*?>', '', th_match.group(1)).strip()
+                field_key = raw_key.lower().replace(" ", "_")
+                val_content = re.sub(r'<.*?>', '', td_match.group(1)).strip()
+                marks_map[field_key] = val_content
+
+        updated_session_id = cookie_jar.get("PHPSESSID")
+        has_refreshed = updated_session_id != php_sess_id
+        final_csrf = cookie_jar.get("_csrf", unquote(csrf_cookie) if csrf_cookie else "")
+
+        scorecard = dict(marks_map)
+        if "course_desc" in scorecard and "course_name" not in scorecard:
+            scorecard["course_name"] = scorecard["course_desc"]
+
+        logger.info(f"[MARKS DETAIL] Scorecard processed in {time.time() - start_time:.3f}s")
+        return {
+            "success": True,
+            "session_refreshed": has_refreshed,
+            "cookies": {
+                "PHPSESSID": updated_session_id,
+                "kl_erp_device_id": cookie_jar.get("kl_erp_device_id", device_id),
+                "SERVERID": cookie_jar.get("SERVERID", server_id),
+                "_csrf_token": final_csrf,
+                "_csrf": final_csrf
+            },
+            "scorecard": scorecard
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[MARKS ERROR] Deep scorecard extraction failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
