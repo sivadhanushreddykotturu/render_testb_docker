@@ -1,0 +1,29 @@
+[Unit]
+Description=KL ERP Backend (FastAPI + Gunicorn + AWS API Gateway IP rotation)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/kl-erp-backend
+EnvironmentFile=/opt/kl-erp-backend/.env
+ExecStart=/opt/kl-erp-backend/venv/bin/gunicorn -c gunicorn_conf.py main:app
+
+# First-ever boot creates the API Gateways (boto3, ~30-90s). Subsequent
+# boots reuse them by name and start in seconds.
+TimeoutStartSec=240
+TimeoutStopSec=30
+
+Restart=always
+RestartSec=5
+
+LimitNOFILE=65536
+
+# Hardening (kept permissive enough for boto3 metadata lookups + logs/ writes)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+gunicorn==21.2.0
+requests==2.31.0
+requests-ip-rotator==1.0.18
+boto3>=1.28,<2
+httpx[http2]==0.27.2
+python-multipart==0.0.6
+onnxruntime
+Pillow
+pymongo[srv]

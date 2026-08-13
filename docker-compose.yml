@@ -1,0 +1,14 @@
+# Convenience wrapper — plain `docker build/run` works fine too (see DEPLOYMENT.md).
+#
+# network_mode: host is used so boto3 can reach the EC2 Instance Metadata
+# Service (IAM instance-role credentials) without raising the IMDSv2 hop
+# limit, and so PORT binds directly on the instance.
+services:
+  backend:
+    build: .
+    container_name: kl-erp-backend
+    network_mode: host
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
