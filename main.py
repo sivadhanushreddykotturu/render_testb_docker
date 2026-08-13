@@ -1157,9 +1157,16 @@ async def fetch_marks_detail(
             response.raise_for_status()
             html_content = response.text
 
-        # Extract rows using matching id markers
-        detail_table_match = re.search(r'<table id="w0".*?>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
+        # Extract rows using matching id markers.
+        # Yii assigns grid widget ids dynamically (w0, w1, ...) depending on
+        # how many widgets the page renders — accept any of them, not just w0.
+        detail_table_match = re.search(r'<table id="w\d+".*?>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
         if not detail_table_match:
+            logger.warning(
+                f"[MARKS DETAIL] scorecard table not found. status={response.status_code} "
+                f"req_url={full_detail_url} final_url={response.url} "
+                f"body_head={html_content[:600]!r}"
+            )
             raise HTTPException(status_code=404, detail="Consolidated detailed scorecard layout missing.")
 
         detail_body = detail_table_match.group(1)
