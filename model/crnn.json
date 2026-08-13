@@ -1,7 +1,0 @@
-{
-  "alphabet": "abcdefghijklmnopqrstuvwxyz",
-  "img_w": 120,
-  "img_h": 50,
-  "model_kind": "crnn_ctc",
-  "blank_idx": 0
-}
