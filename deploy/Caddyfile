@@ -1,0 +1,15 @@
+# Caddy reverse proxy — automatic HTTPS (Let's Encrypt) for the backend.
+#
+# Setup:
+#   1. Point a DNS A record for your subdomain at the instance's Elastic IP
+#      (e.g. api.yourdomain.com, or a free DuckDNS subdomain).
+#   2. Replace the domain below with yours.
+#   3. sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+#      sudo systemctl reload caddy
+#
+# Caddy listens on 80/443 (open both in the security group; port 80 is used
+# for the Let's Encrypt challenge) and forwards to the container on :8000.
+
+api.yourdomain.com {
+	reverse_proxy 127.0.0.1:8000
+}

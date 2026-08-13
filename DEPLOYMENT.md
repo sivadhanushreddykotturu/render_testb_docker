@@ -106,7 +106,39 @@ Expected health response:
 ```
 
 First boot takes **~30–90s** (creates the API Gateways in AWS). Then point
-your client app at `http://<ec2-public-ip>:8000`.
+your client app at `http://<ec2-public-ip>:8000` — or better, set up HTTPS:
+
+## Step 5 — HTTPS via Caddy (required if your app is served over HTTPS)
+
+Browsers block HTTPS pages from calling HTTP APIs ("mixed content"), so the
+backend needs a real TLS cert — which requires a **domain**. Caddy gives you
+auto-issued, auto-renewed Let's Encrypt certificates with a 3-line config.
+
+1. **Stable IP:** EC2 → Elastic IPs → Allocate → Associate with the instance
+   (otherwise the public IP changes on every stop/start and DNS breaks).
+2. **DNS:** create an A record `api.yourdomain.com` → the Elastic IP.
+   No domain? Grab a free subdomain at [duckdns.org](https://www.duckdns.org)
+   (works fine with Let's Encrypt).
+3. **Security group:** open inbound **80** and **443** (0.0.0.0/0).
+4. **Install + configure Caddy on the instance:**
+   ```bash
+   sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
+   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+   sudo apt-get update && sudo apt-get install -y caddy
+
+   sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+   sudo nano /etc/caddy/Caddyfile      # replace api.yourdomain.com with your domain
+   sudo systemctl reload caddy
+   ```
+5. **Verify:** `curl https://api.yourdomain.com/` → healthy JSON.
+   Certificate issuance takes a few seconds on first request; watch
+   `journalctl -u caddy -f` if anything looks stuck (almost always DNS or SG).
+6. **Lock down 8000:** remove the inbound-8000 rule from the security group —
+   traffic now enters only via Caddy (443), which proxies to the container
+   over localhost.
+7. **Client app:** change the API base URL from `http://<ip>:8000` to
+   `https://api.yourdomain.com`. CORS is already open (`allow_origins=["*"]`).
 
 ---
 
