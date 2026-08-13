@@ -65,6 +65,9 @@ sudo systemctl enable --now docker
 sudo usermod -aG docker ubuntu && newgrp docker
 
 # Build + run
+mkdir -p logs    # IMPORTANT: create as ubuntu BEFORE first run — Docker
+                 # creates missing bind-mount sources as root, and the
+                 # container runs as non-root (uid 1000) and cannot write there.
 docker build -t kl-erp-backend .
 docker run -d --name kl-erp-backend --network host \
     --env-file .env --restart unless-stopped \
@@ -134,6 +137,15 @@ your client app at `http://<ec2-public-ip>:8000`.
 
 ## Notes & gotchas
 
+- **`PermissionError: /app/logs/production_api.log`:** the host `logs/` dir
+  was created by Docker as root. Fix once with
+  `sudo chown -R ubuntu:ubuntu logs && docker restart kl-erp-backend`.
+  (Current code degrades to console-only logging instead of crashing.)
+- **`NoCredentialsError` at boot:** no IAM role attached / no AWS keys in
+  `.env`. Attach the role (then `docker restart`) or set keys (then
+  `docker rm -f` + re-run — `docker restart` does NOT reload `--env-file`).
+- **`Could not create region ... ap-south-2`:** opt-in region not enabled on
+  the account — non-fatal, runs on `ap-south-1` only.
 - **TLS verification is ON** (`verify=True`): traffic terminates at AWS with
   a valid ACM cert. The old `verify=False` only existed for the residential
   MITM proxy.

@@ -19,8 +19,11 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY main.py gateway_proxy.py gunicorn_conf.py ./
 COPY model/ ./model/
 
-# Run as non-root
-RUN useradd --create-home appuser && chown -R appuser:appuser /app
+# Run as non-root; pre-create the log dir owned by appuser (only effective
+# when no host bind mount shadows it)
+RUN useradd --create-home appuser \
+    && mkdir -p /app/logs \
+    && chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8000

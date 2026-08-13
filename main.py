@@ -61,8 +61,6 @@ except ImportError:
     logger.warning("pymongo not installed — game leaderboard will use in-memory store.")
 
 # ------------------ LOGGING WITH TIME SEEDS & FILE PERSISTENCE ------------------
-os.makedirs("logs", exist_ok=True)
-
 log_format_string = "%(asctime)s.%(munit)s [%(levelname)s] %(message)s"
 log_date_format = "%Y-%m-%d %H:%M:%S"
 
@@ -71,12 +69,20 @@ log_formatter = logging.Formatter(fmt=log_format_string, datefmt=log_date_format
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(log_formatter)
 
-file_handler = logging.FileHandler("logs/production_api.log", mode="a", encoding="utf-8")
-file_handler.setFormatter(log_formatter)
+_log_handlers = [console_handler]
+try:
+    os.makedirs("logs", exist_ok=True)
+    file_handler = logging.FileHandler("logs/production_api.log", mode="a", encoding="utf-8")
+    file_handler.setFormatter(log_formatter)
+    _log_handlers.append(file_handler)
+except OSError as log_err:
+    # Never let log-file permissions kill the app (e.g. a root-owned Docker
+    # bind mount) — degrade to console-only logging instead.
+    print(f"[WARN] Log file unavailable, console-only logging: {log_err}")
 
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[console_handler, file_handler]
+    handlers=_log_handlers
 )
 
 old_factory = logging.getLogRecordFactory()
