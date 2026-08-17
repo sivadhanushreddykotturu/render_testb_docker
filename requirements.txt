@@ -9,3 +9,5 @@ python-multipart==0.0.6
 onnxruntime
 Pillow
 pymongo[srv]
+beautifulsoup4==4.12.3
+lxml==5.1.0

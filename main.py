@@ -22,6 +22,7 @@ import base64
 import secrets
 import datetime
 import functools
+from bs4 import BeautifulSoup
 
 from requests_ip_rotator import ApiGateway
 from gateway_proxy import ApiGatewayTransport, GatewayUnavailableError
@@ -718,9 +719,10 @@ async def fetch_register_details(
             response.raise_for_status()
             html_text = response.text
 
-        from bs4 import BeautifulSoup as _BS
-
-        soup = _BS(html_text, "lxml")
+        try:
+            soup = BeautifulSoup(html_text, "lxml")
+        except Exception:
+            soup = BeautifulSoup(html_text, "html.parser")
         table = soup.find("table", class_=lambda c: c and "table-striped" in c and "table-bordered" in c)
         if not table:
             return {"success": False, "message": "Register table missing."}
