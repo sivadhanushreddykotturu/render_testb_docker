@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Form, HTTPException, Request
+﻿from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -741,37 +741,37 @@ async def fetch_register_details(
                 response.raise_for_status()
                 html_text = response.text
 
-        table_match = re.search(
-            r'<table[^>]*class=["\']table table-striped table-bordered["\'][^>]*>(.*?)</table>',
-            html_text, re.DOTALL | re.IGNORECASE
-        )
-        if not table_match:
+        from bs4 import BeautifulSoup as _BS
+
+        soup = _BS(html_text, "lxml")
+        table = soup.find("table", class_=lambda c: c and "table-striped" in c and "table-bordered" in c)
+        if not table:
             return {"success": False, "message": "Register table missing."}
 
-        table_body = table_match.group(1)
-        raw_headers = re.findall(r'<th.*?>(.*?)</th>', table_body, re.IGNORECASE)
-        headers = [re.sub(r'<.*?>', '', h).strip() for h in raw_headers if h.strip()]
+        headers = [th.get_text(strip=True) for th in table.find_all("th") if th.get_text(strip=True)]
 
         metadata_count = 14
         metadata_headers = headers[:metadata_count]
         daily_headers = headers[metadata_count:]
 
-        tbody_match = re.search(r'<tbody.*?>(.*?)</tbody>', table_body, re.DOTALL | re.IGNORECASE)
-        if not tbody_match:
+        tbody = table.find("tbody")
+        if not tbody:
             return {"success": False, "message": "Calendar data rows missing."}
 
-        cells = re.findall(r'<td.*?>(.*?)</td>', tbody_match.group(1), re.DOTALL | re.IGNORECASE)
+        cells = [td.get_text(strip=True) for td in tbody.find_all("td")]
+
         if len(cells) < metadata_count:
+            logger.warning(f"[LAZY-REGISTER] Only {len(cells)} cells, expected {metadata_count}+")
             return {"success": False, "message": "Truncated layout array returns."}
 
-        metadata = {header: re.sub(r'<.*?>', '', cells[i]).strip()
-                    for i, header in enumerate(metadata_headers) if i < len(cells)}
+        metadata = {header: cells[i] for i, header in enumerate(metadata_headers) if i < len(cells)}
 
         daily_attendance = [
-            {"date_slot": header, "status": re.sub(r'<.*?>', '', cells[metadata_count + i]).strip()}
+            {"date_slot": header, "status": cells[metadata_count + i]}
             for i, header in enumerate(daily_headers)
             if metadata_count + i < len(cells)
         ]
+
 
         updated_session_id = cookie_jar.get("PHPSESSID")
         has_refreshed = updated_session_id != php_sess_id
