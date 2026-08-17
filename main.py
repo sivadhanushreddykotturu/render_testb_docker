@@ -1,4 +1,4 @@
-﻿from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -675,7 +675,13 @@ async def fetch_register_details(
     }
 
     try:
-        async with make_erp_client() as client:
+        # Register detail URLs contain encrypted binary parameters with non-UTF-8 bytes 
+        # (e.g. %F5%B6%EA%9F...) which AWS API Gateway REST APIs parse, re-encode and corrupt, 
+        # resulting in HTTP 400 Bad Request. We request directly from the host.
+        async with httpx.AsyncClient(
+            verify=False, headers=DEFAULT_HEADERS, http2=True,
+            event_hooks={"response": [log_rate_limit]}
+        ) as client:
             if not php_sess_id or not csrf_cookie:
                 logger.info(f"[LAZY-REGISTER] Cold-start auto-login for {username}")
                 for attempt in range(3):
@@ -711,35 +717,6 @@ async def fetch_register_details(
 
             response.raise_for_status()
             html_text = response.text
-
-        if "not a valid id" in html_text[:300].lower():
-            # API Gateway REST APIs parse+rebuild query strings as text, which
-            # corrupts Yii's encrypted binary id params (non-UTF-8 bytes). A raw
-            # TCP proxy forwarded them untouched. Rare request — retry direct.
-            logger.warning("[LAZY-REGISTER] Encrypted id corrupted via gateway (\"Not a Valid Id\"). Retrying direct from EC2...")
-            async with httpx.AsyncClient(
-                verify=False, headers=DEFAULT_HEADERS, http2=True,
-                event_hooks={"response": [log_rate_limit]}
-            ) as direct_client:
-                response = await direct_client.get(register_url_with_csrf, cookies=cookie_jar, timeout=15)
-
-                if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
-                    logger.warning("[LAZY-REGISTER] Session invalid on direct retry. Auto-healing...")
-                    for attempt in range(3):
-                        if attempt > 0:
-                            await asyncio.sleep(random.uniform(1.0, 2.0))
-                        login_response, cookie_jar = await auto_login(direct_client, username, password, seed_cookies=cookie_jar)
-                        if not is_login_failed(login_response):
-                            break
-                    else:
-                        raise HTTPException(status_code=401, detail="Authentication credentials expired.")
-
-                    active_csrf = extract_csrf(login_response.text) or cookie_jar.get("_csrf", "")
-                    register_url_with_csrf = f"{register_url}&_csrf={active_csrf}"
-                    response = await direct_client.get(register_url_with_csrf, cookies=cookie_jar, timeout=15)
-
-                response.raise_for_status()
-                html_text = response.text
 
         from bs4 import BeautifulSoup as _BS
 
@@ -1167,7 +1144,13 @@ async def fetch_marks_detail(
         full_detail_url = f"{BASE_URL}/{target_href.lstrip('/')}"
 
     try:
-        async with make_erp_client() as client:
+        # Marks detail URLs contain encrypted binary parameters with non-UTF-8 bytes 
+        # (e.g. %F5%B6%EA%9F...) which AWS API Gateway REST APIs parse, re-encode and corrupt, 
+        # resulting in HTTP 400 Bad Request. We request directly from the host.
+        async with httpx.AsyncClient(
+            verify=False, headers=DEFAULT_HEADERS, http2=True,
+            event_hooks={"response": [log_rate_limit]}
+        ) as client:
             response = await client.get(full_detail_url, cookies=cookie_jar, timeout=15)
 
             if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
@@ -1185,33 +1168,6 @@ async def fetch_marks_detail(
 
             response.raise_for_status()
             html_content = response.text
-
-        if "not a valid id" in html_content[:300].lower():
-            # API Gateway REST APIs parse+rebuild query strings as text, which
-            # corrupts Yii's encrypted binary id param (non-UTF-8 bytes). A raw
-            # TCP proxy forwarded it untouched. Rare request — retry direct.
-            logger.warning("[MARKS DETAIL] Encrypted id corrupted via gateway (\"Not a Valid Id\"). Retrying direct from EC2...")
-            async with httpx.AsyncClient(
-                verify=False, headers=DEFAULT_HEADERS, http2=True,
-                event_hooks={"response": [log_rate_limit]}
-            ) as direct_client:
-                response = await direct_client.get(full_detail_url, cookies=cookie_jar, timeout=15)
-
-                if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
-                    logger.warning("[MARKS DETAIL] Session invalid on direct retry. Launching auto-login fallback...")
-                    for attempt in range(3):
-                        if attempt > 0:
-                            await asyncio.sleep(random.uniform(1.0, 2.0))
-                        res, cookie_jar = await auto_login(direct_client, username, password, seed_cookies=cookie_jar)
-                        if not is_login_failed(res):
-                            break
-                    else:
-                        raise HTTPException(status_code=401, detail="Session verification recovery rejected.")
-
-                    response = await direct_client.get(full_detail_url, cookies=cookie_jar, timeout=15)
-
-                response.raise_for_status()
-                html_content = response.text
 
         # Extract rows using matching id markers.
         # Yii assigns grid widget ids dynamically (w0, w1, ...) depending on
