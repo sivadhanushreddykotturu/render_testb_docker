@@ -2216,7 +2216,10 @@ def _add_radio_history_doc(item: dict):
         "videoId": item.get("videoId"),
         "title": item.get("title"),
         "artist": item.get("artist"),
-        "added_by": item.get("added_by"),
+        "thumbnail": item.get("thumbnail", ""),
+        "duration_text": item.get("duration_text", ""),
+        "duration_sec": item.get("duration_sec", 0),
+        "added_by": item.get("added_by", "anonymous"),
         "played_at": time.time(),
     }
     if _radio_history_col is not None:
@@ -2226,14 +2229,18 @@ def _add_radio_history_doc(item: dict):
             logger.error(f"[RADIO] Mongo history insert error: {e}")
     _mem_radio_history.append(hist_entry)
 
-def _get_recent_radio_history(since_sec: int = RADIO_ANTI_REPEAT_SEC) -> list[dict]:
-    cutoff = time.time() - since_sec
+def _get_recent_radio_history(limit: int = 10, since_sec: int = None) -> list[dict]:
+    cutoff = (time.time() - since_sec) if since_sec else 0
     if _radio_history_col is not None:
         try:
-            return list(_radio_history_col.find({"played_at": {"$gte": cutoff}}, {"_id": 0}))
+            query = {"played_at": {"$gte": cutoff}} if cutoff > 0 else {}
+            cursor = _radio_history_col.find(query, {"_id": 0}).sort("played_at", -1).limit(limit)
+            return list(cursor)
         except Exception as e:
             logger.error(f"[RADIO] Mongo history read error: {e}")
-    return [h for h in _mem_radio_history if h.get("played_at", 0) >= cutoff]
+    filtered = [h for h in _mem_radio_history if h.get("played_at", 0) >= cutoff]
+    filtered.sort(key=lambda x: x.get("played_at", 0), reverse=True)
+    return filtered[:limit]
 
 def _check_and_update_cooldown(user_id: str) -> tuple[bool, int]:
     """Returns (is_allowed, remaining_cooldown_seconds)."""
@@ -2402,6 +2409,9 @@ async def _get_current_radio_state(user_id: str = "") -> dict:
     if state.get("status") == "playing" and state.get("started_at"):
         elapsed_ms = max(0, now_ms - int(state["started_at"]))
 
+    # Retrieve last 10 played tracks
+    recent_history = _get_recent_radio_history(limit=10)
+
     return {
         "success": True,
         "server_time": now_ms,
@@ -2411,6 +2421,7 @@ async def _get_current_radio_state(user_id: str = "") -> dict:
         "current_track": state.get("track"),
         "reports_count": len(state.get("reports", [])),
         "queue": queue,
+        "recent_history": recent_history,
     }
 
 # ============================================================
@@ -2514,6 +2525,23 @@ async def radio_add_queue(
         raise HTTPException(
             status_code=400,
             detail="Only songs, audio, and music tracks can be queued on Campus Radio. Skits, trailers, and talk shows are blocked."
+        )
+
+    # Check if song is currently playing
+    state = _get_radio_state_doc()
+    if state.get("status") == "playing" and state.get("track", {}).get("videoId") == videoId.strip():
+        raise HTTPException(status_code=400, detail="This song is currently playing live on air.")
+
+    # Check if song was played recently (anti-repeat lock: 45 minutes)
+    recent_history = _get_recent_radio_history(limit=20, since_sec=RADIO_ANTI_REPEAT_SEC)
+    recent_match = next((h for h in recent_history if h.get("videoId") == videoId.strip()), None)
+    if recent_match:
+        played_at = float(recent_match.get("played_at", 0))
+        mins_ago = max(0, int((time.time() - played_at) / 60))
+        remaining_lock_mins = max(1, int((RADIO_ANTI_REPEAT_SEC - (time.time() - played_at)) / 60))
+        raise HTTPException(
+            status_code=400,
+            detail=f"This song was played {mins_ago}m ago. To keep the radio fresh, it can be queued again in {remaining_lock_mins} minutes."
         )
 
     # Google ML category verification (blocks anything where category != 'Music')
