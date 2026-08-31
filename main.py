@@ -2753,7 +2753,7 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
     logger.info(f"[HLS STREAMER] Downloading audio for videoId: {clean_vid}")
     url = f"https://www.youtube.com/watch?v={clean_vid}"
 
-    # 1. Primary: yt-dlp with android client simulation (bypasses bot verification)
+    # 1. Primary: yt-dlp with PO-Token provider sidecar & android/web client
     try:
         import yt_dlp
         ydl_opts = {
@@ -2764,12 +2764,12 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
             "noplaylist": True,
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android"],
-                    "player_skip": ["webpage", "configs"],
+                    "player_client": ["android", "web"],
+                    "pot_provider": "http://127.0.0.1:4416/pot",
                 }
             },
             "http_headers": {
-                "User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
             },
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -2778,10 +2778,10 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
         downloaded = list(CACHE_DIR.glob(f"{clean_vid}.*"))
         for f in downloaded:
             if f.is_file() and f.stat().st_size > 10000:
-                logger.info(f"[HLS STREAMER] Successfully cached {clean_vid} via yt-dlp android ({f.stat().st_size} bytes)")
+                logger.info(f"[HLS STREAMER] Successfully cached {clean_vid} ({f.stat().st_size} bytes)")
                 return f
     except Exception as e:
-        logger.warning(f"[HLS STREAMER] yt-dlp android attempt failed for {clean_vid}: {e}")
+        logger.warning(f"[HLS STREAMER] yt-dlp attempt failed for {clean_vid}: {e}")
 
     # 2. Secondary Fallback: Invidious / Piped audio stream extraction
     piped_instances = [
