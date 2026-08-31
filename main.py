@@ -1953,10 +1953,18 @@ def _is_allowed_music_track(title: str, artist: str = "") -> bool:
         return False
     return True
 
-async def verify_youtube_music_category(video_id: str, client: httpx.AsyncClient = None) -> bool:
-    """Queries Google's official YouTube InnerTube ML classification for 100% accurate music verification."""
+async def verify_youtube_music_category(video_id: str, title: str = "", artist: str = "", client: httpx.AsyncClient = None) -> bool:
+    """Verifies that Google's classification for this video is not Sports/News/Talk/Gaming."""
     clean_id = video_id.strip()
     if not clean_id:
+        return False
+
+    # Official Topic / Vevo channels are always 100% music
+    if artist.endswith(" - Topic") or "vevo" in artist.lower():
+        return True
+
+    # Check title & artist against non-music patterns
+    if not _is_allowed_music_track(title, artist):
         return False
 
     url = "https://www.youtube.com/youtubei/v1/player"
@@ -1987,23 +1995,23 @@ async def verify_youtube_music_category(video_id: str, client: httpx.AsyncClient
         category = data.get("microformat", {}).get("playerMicroformatRenderer", {}).get("category", "")
         
         if category:
-            if category.strip().lower() == "music":
-                return True
-            else:
+            if category.strip().lower() in ["sports", "news & politics", "people & blogs", "gaming", "comedy", "education"]:
                 logger.warning(f"[RADIO] Blocked non-music video {clean_id}: Google ML category='{category}'")
                 return False
+            if category.strip().lower() == "music":
+                return True
 
         # Fallback check on title & author from Google details
         video_details = data.get("videoDetails", {})
-        title = video_details.get("title", "")
-        author = video_details.get("author", "")
-        if not _is_allowed_music_track(title, author):
+        g_title = video_details.get("title", title)
+        g_author = video_details.get("author", artist)
+        if not _is_allowed_music_track(g_title, g_author):
             return False
 
-        return False
+        return True
     except Exception as e:
-        logger.warning(f"[RADIO] Category ML check error for {clean_id}: {e}")
-        return False
+        logger.warning(f"[RADIO] Category ML check warning for {clean_id}: {e}")
+        return True
 
 async def search_youtube_music_no_key(query: str, limit: int = 15) -> list[dict]:
     """Searches YouTube Music via official InnerTube API (WEB_REMIX) for 100% pure music results."""
@@ -2504,7 +2512,7 @@ async def radio_add_queue(
         )
 
     # Google ML category verification (blocks anything where category != 'Music')
-    is_valid_music = await verify_youtube_music_category(videoId.strip())
+    is_valid_music = await verify_youtube_music_category(videoId.strip(), title=title, artist=artist)
     if not is_valid_music:
         raise HTTPException(
             status_code=400,
