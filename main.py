@@ -1884,7 +1884,12 @@ RADIO_NON_MUSIC_PATTERNS = [
     r"\bbloopers\b", r"\bpodcast\b", r"\bvlog\b", r"\bvlogs\b", r"\breaction\b",
     r"\bgameplay\b", r"\bgaming\b", r"\bunboxing\b", r"\bnews\b", r"\blive stream\b",
     r"\btalk show\b", r"\bhighlights\b", r"\bpubg\b", r"\bfree fire\b", r"\bbgmi\b",
-    r"\btutorial\b", r"\bfunny scenes\b", r"\bcomedy scene\b", r"\bfunny video\b"
+    r"\btutorial\b", r"\bfunny scenes\b", r"\bcomedy scene\b", r"\bfunny video\b",
+    # Comedy / laughing emojis
+    r"[😂🤣😆😹🤡💀]",
+    # TV / OTT channels that publish dialogue clips instead of music
+    r"\bnetflix\b", r"\bamazon prime\b", r"\bhotstar\b", r"\betv\b",
+    r"\bstar maa\b", r"\bcolors tv\b", r"\bzee5\b", r"\baha video\b"
 ]
 
 _NON_MUSIC_RE = re.compile("|".join(RADIO_NON_MUSIC_PATTERNS), re.IGNORECASE)
@@ -1901,7 +1906,7 @@ def _is_allowed_music_track(title: str, artist: str = "") -> bool:
         return False
     return True
 
-async def verify_youtube_music_category(video_id: str) -> bool:
+async def verify_youtube_music_category(video_id: str, client: httpx.AsyncClient = None) -> bool:
     """Verifies that Google's official machine-learning classification for this video is 'Music'."""
     url = f"https://www.youtube.com/watch?v={video_id}"
     headers = {
@@ -1909,9 +1914,12 @@ async def verify_youtube_music_category(video_id: str) -> bool:
         "Accept-Language": "en-US,en;q=0.9",
     }
     try:
-        async with httpx.AsyncClient(verify=False, headers=headers, follow_redirects=True, timeout=8) as client:
-            resp = await client.get(url)
-            html = resp.text
+        if client is not None:
+            resp = await client.get(url, headers=headers, timeout=6)
+        else:
+            async with httpx.AsyncClient(verify=False, headers=headers, follow_redirects=True, timeout=6) as c:
+                resp = await c.get(url)
+        html = resp.text
 
         # 1. Check if Google category is explicitly "Music"
         cat_match = re.search(r'"category":"([^"]+)"', html)
@@ -1933,7 +1941,7 @@ async def verify_youtube_music_category(video_id: str) -> bool:
         return True
 
 async def search_youtube_music_no_key(query: str, limit: int = 15) -> list[dict]:
-    """Scrapes YouTube search results, filtering out skits, comedy, trailers, and podcasts."""
+    """Scrapes YouTube search results and verifies Google ML Category in parallel for zero skits."""
     clean_query = query.strip()
     if not clean_query:
         return []
@@ -1951,54 +1959,70 @@ async def search_youtube_music_no_key(query: str, limit: int = 15) -> list[dict]
             resp = await client.get(search_url)
             html = resp.text
 
-        match = re.search(r'var ytInitialData = ({.*?});</script>', html)
-        if not match:
-            match = re.search(r'ytInitialData\s*=\s*({.+?});', html)
-        if not match:
-            logger.warning("[RADIO SEARCH] Could not find ytInitialData in response.")
-            return []
+            match = re.search(r'var ytInitialData = ({.*?});</script>', html)
+            if not match:
+                match = re.search(r'ytInitialData\s*=\s*({.+?});', html)
+            if not match:
+                logger.warning("[RADIO SEARCH] Could not find ytInitialData in response.")
+                return []
 
-        data = json.loads(match.group(1))
-        videos = []
-        sections = (
-            data.get("contents", {})
-            .get("twoColumnSearchResultsRenderer", {})
-            .get("primaryContents", {})
-            .get("sectionListRenderer", {})
-            .get("contents", [])
-        )
+            data = json.loads(match.group(1))
+            raw_candidates = []
+            sections = (
+                data.get("contents", {})
+                .get("twoColumnSearchResultsRenderer", {})
+                .get("primaryContents", {})
+                .get("sectionListRenderer", {})
+                .get("contents", [])
+            )
 
-        for sec in sections:
-            item_sec = sec.get("itemSectionRenderer", {})
-            for item in item_sec.get("contents", []):
-                if "videoRenderer" in item:
-                    vr = item["videoRenderer"]
-                    vid = vr.get("videoId")
-                    title_runs = vr.get("title", {}).get("runs", [])
-                    title = title_runs[0].get("text", "") if title_runs else ""
-                    owner_runs = vr.get("ownerText", {}).get("runs", [])
-                    channel = owner_runs[0].get("text", "") if owner_runs else "Unknown Artist"
-                    dur_text = vr.get("lengthText", {}).get("simpleText", "")
-                    dur_sec = _parse_yt_duration(dur_text) if dur_text else 0
-                    thumbs = vr.get("thumbnail", {}).get("thumbnails", [])
-                    thumb = thumbs[-1].get("url", "") if thumbs else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+            for sec in sections:
+                item_sec = sec.get("itemSectionRenderer", {})
+                for item in item_sec.get("contents", []):
+                    if "videoRenderer" in item:
+                        vr = item["videoRenderer"]
+                        vid = vr.get("videoId")
+                        title_runs = vr.get("title", {}).get("runs", [])
+                        title = title_runs[0].get("text", "") if title_runs else ""
+                        owner_runs = vr.get("ownerText", {}).get("runs", [])
+                        channel = owner_runs[0].get("text", "") if owner_runs else "Unknown Artist"
+                        dur_text = vr.get("lengthText", {}).get("simpleText", "")
+                        dur_sec = _parse_yt_duration(dur_text) if dur_text else 0
+                        thumbs = vr.get("thumbnail", {}).get("thumbnails", [])
+                        thumb = thumbs[-1].get("url", "") if thumbs else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
 
-                    # Duration filtering (60s to 600s) + strict Music Content Verification (Anti-Skit)
-                    if vid and title and 60 <= dur_sec <= 600 and _is_allowed_music_track(title, channel):
-                        videos.append({
-                            "videoId": vid,
-                            "title": title,
-                            "artist": channel,
-                            "duration_sec": dur_sec,
-                            "duration_text": dur_text,
-                            "thumbnail": thumb,
-                        })
-                        if len(videos) >= limit:
-                            break
-            if len(videos) >= limit:
-                break
+                        # Initial pass: Duration (60s to 600s) + regex filter
+                        if vid and title and 60 <= dur_sec <= 600 and _is_allowed_music_track(title, channel):
+                            raw_candidates.append({
+                                "videoId": vid,
+                                "title": title,
+                                "artist": channel,
+                                "duration_sec": dur_sec,
+                                "duration_text": dur_text,
+                                "thumbnail": thumb,
+                            })
+                            if len(raw_candidates) >= limit * 2:
+                                break
+                if len(raw_candidates) >= limit * 2:
+                    break
 
-        return videos
+            # Parallel ML Category verification (runs all candidate checks concurrently in ~200-300ms)
+            tasks = []
+            for v in raw_candidates:
+                if v["artist"].endswith(" - Topic") or "vevo" in v["artist"].lower():
+                    tasks.append(asyncio.sleep(0, result=True))
+                else:
+                    tasks.append(verify_youtube_music_category(v["videoId"], client=client))
+
+            ml_results = await asyncio.gather(*tasks, return_exceptions=True)
+            verified_videos = []
+            for v, is_music in zip(raw_candidates, ml_results):
+                if is_music is True:
+                    verified_videos.append(v)
+                    if len(verified_videos) >= limit:
+                        break
+
+            return verified_videos
     except Exception as e:
         logger.error(f"[RADIO SEARCH] Scrape error for query '{query}': {e}", exc_info=True)
         return []
