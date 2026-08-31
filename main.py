@@ -2740,7 +2740,7 @@ async def _periodic_cache_cleaner_task():
             await asyncio.sleep(60)
 
 def _download_radio_audio_track(video_id: str) -> Path | None:
-    """Pre-downloads high quality audio track from YouTube using yt-dlp directly."""
+    """Pre-downloads high quality audio track from YouTube using yt-dlp with android/ios simulation & piped fallback."""
     _ensure_hls_dirs()
     clean_vid = video_id.strip()
 
@@ -2753,6 +2753,7 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
     logger.info(f"[HLS STREAMER] Downloading audio for videoId: {clean_vid}")
     url = f"https://www.youtube.com/watch?v={clean_vid}"
 
+    # 1. Primary: yt-dlp with android client simulation (bypasses bot verification)
     try:
         import yt_dlp
         ydl_opts = {
@@ -2763,8 +2764,12 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
             "noplaylist": True,
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android", "ios", "web_embedded", "web"]
+                    "player_client": ["android", "ios"],
+                    "player_skip": ["webpage", "configs"],
                 }
+            },
+            "http_headers": {
+                "User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip"
             },
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -2773,11 +2778,36 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
         downloaded = list(CACHE_DIR.glob(f"{clean_vid}.*"))
         for f in downloaded:
             if f.is_file() and f.stat().st_size > 10000:
-                logger.info(f"[HLS STREAMER] Successfully cached {clean_vid} -> {f.name} ({f.stat().st_size} bytes)")
+                logger.info(f"[HLS STREAMER] Successfully cached {clean_vid} via yt-dlp android ({f.stat().st_size} bytes)")
                 return f
-        logger.error(f"[HLS STREAMER] Download completed but no valid file found for {clean_vid}")
     except Exception as e:
-        logger.error(f"[HLS STREAMER] Exception downloading track {clean_vid}: {e}")
+        logger.warning(f"[HLS STREAMER] yt-dlp android attempt failed for {clean_vid}: {e}")
+
+    # 2. Secondary Fallback: Invidious / Piped audio stream extraction
+    piped_instances = [
+        f"https://pipedapi.kavin.rocks/streams/{clean_vid}",
+        f"https://api.piped.privacydev.net/streams/{clean_vid}",
+        f"https://pipedapi.tokhmi.xyz/streams/{clean_vid}",
+    ]
+    for instance_url in piped_instances:
+        try:
+            with httpx.Client(timeout=8) as client:
+                resp = client.get(instance_url)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    audio_streams = data.get("audioStreams", [])
+                    if audio_streams:
+                        stream_url = audio_streams[0]["url"]
+                        target_file = CACHE_DIR / f"{clean_vid}.m4a"
+                        dl_cmd = ["ffmpeg", "-y", "-i", stream_url, "-c", "copy", str(target_file)]
+                        subprocess.run(dl_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+                        if target_file.exists() and target_file.stat().st_size > 10000:
+                            logger.info(f"[HLS STREAMER] Successfully cached {clean_vid} via Piped Stream ({target_file.stat().st_size} bytes)")
+                            return target_file
+        except Exception:
+            continue
+
+    logger.error(f"[HLS STREAMER] All download strategies failed for {clean_vid}")
     return None
 
 def _launch_persistent_ffmpeg():
@@ -2901,7 +2931,8 @@ def _hls_radio_worker_thread():
                         "reports": [],
                     }
                     _save_radio_state_doc(new_state)
-                    _remove_radio_queue_doc(chosen_track["queue_id"])
+                    if chosen_track.get("queue_id"):
+                        _remove_radio_queue_doc(chosen_track["queue_id"])
                     _add_radio_history_doc(chosen_track)
 
                     decode_cmd = [
@@ -2960,7 +2991,8 @@ def _hls_radio_worker_thread():
                     except Exception:
                         pass
                 else:
-                    _remove_radio_queue_doc(chosen_track["queue_id"])
+                    if chosen_track.get("queue_id"):
+                        _remove_radio_queue_doc(chosen_track["queue_id"])
                     time.sleep(1)
             else:
                 _hls_current_track = None
