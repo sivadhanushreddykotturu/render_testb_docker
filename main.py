@@ -1901,6 +1901,37 @@ def _is_allowed_music_track(title: str, artist: str = "") -> bool:
         return False
     return True
 
+async def verify_youtube_music_category(video_id: str) -> bool:
+    """Verifies that Google's official machine-learning classification for this video is 'Music'."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    headers = {
+        "User-Agent": DEFAULT_HEADERS["User-Agent"],
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        async with httpx.AsyncClient(verify=False, headers=headers, follow_redirects=True, timeout=8) as client:
+            resp = await client.get(url)
+            html = resp.text
+
+        # 1. Check if Google category is explicitly "Music"
+        cat_match = re.search(r'"category":"([^"]+)"', html)
+        if cat_match:
+            cat = cat_match.group(1).strip()
+            if cat.lower() == "music":
+                return True
+            else:
+                logger.warning(f"[RADIO] Blocked non-music video {video_id}: category={cat}")
+                return False
+
+        # 2. Check if topicCategories has Music
+        if "topicCategories" in html and ("Music" in html or "wiki/Music" in html):
+            return True
+
+        return True
+    except Exception as e:
+        logger.warning(f"[RADIO] Category check fallback on error: {e}")
+        return True
+
 async def search_youtube_music_no_key(query: str, limit: int = 15) -> list[dict]:
     """Scrapes YouTube search results, filtering out skits, comedy, trailers, and podcasts."""
     clean_query = query.strip()
@@ -2327,6 +2358,14 @@ async def radio_add_queue(
         raise HTTPException(
             status_code=400,
             detail="Only songs, audio, and music tracks can be queued on Campus Radio. Skits, trailers, and talk shows are blocked."
+        )
+
+    # Google ML category verification (blocks anything where category != 'Music')
+    is_valid_music = await verify_youtube_music_category(videoId.strip())
+    if not is_valid_music:
+        raise HTTPException(
+            status_code=400,
+            detail="This video is classified as non-music by YouTube (entertainment/comedy/podcast). Only music tracks are allowed."
         )
 
     # Check cooldown (1 add per 10 minutes per student)
