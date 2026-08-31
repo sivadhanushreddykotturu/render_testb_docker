@@ -1532,6 +1532,10 @@ if _pymongo_available and MONGODB_URI:
         _game_db = _mongo_client["timetablekl"]
         _scores_col = _game_db["game_scores"]
         _jti_col = _game_db["game_jtis"]
+        _radio_state_col = _game_db["radio_state"]
+        _radio_queue_col = _game_db["radio_queue"]
+        _radio_history_col = _game_db["radio_history"]
+        _radio_cooldowns_col = _game_db["radio_cooldowns"]
         # Daily leagues: scores are scoped per (gameId, userId, day, device) —
         # a player's phone best and pc best are separate records, so a score
         # made on one device can never leak into the other league's board.
@@ -1545,11 +1549,18 @@ if _pymongo_available and MONGODB_URI:
             unique=True,
         )
         _jti_col.create_index("expiresAt", expireAfterSeconds=0)
-        logger.info("✅ MongoDB connected — game leaderboard persistent.")
+        _radio_history_col.create_index("played_at")
+        _radio_queue_col.create_index("queue_id", unique=True)
+        _radio_cooldowns_col.create_index("user_id", unique=True)
+        logger.info("✅ MongoDB connected — game leaderboard and campus radio persistent.")
     except Exception as e:
-        logger.error(f"[GAME] MongoDB init failed, using in-memory leaderboard: {e}")
+        logger.error(f"[GAME/RADIO] MongoDB init failed, using in-memory fallback: {e}")
         _scores_col = None
         _jti_col = None
+        _radio_state_col = None
+        _radio_queue_col = None
+        _radio_history_col = None
+        _radio_cooldowns_col = None
 
 _mem_scores = {}  # (gameId, userId, day) -> score int
 _mem_jtis = {}    # jti -> expiry epoch
@@ -1752,3 +1763,647 @@ async def game_submit(token: str = Form(...), score: int = Form(...)):
 async def game_leaderboard(gameId: str = "dino", limit: int = 3, device: str = "all"):
     dev = device if device in ("mobile", "desktop") else None
     return {"success": True, "gameId": gameId, "leaderboard": _top_scores(gameId, limit, dev)}
+
+
+# ============================================================
+# CAMPUS RADIO · SYNCHRONIZED PLAYBACK & TIME-DECAYED QUEUE
+# ============================================================
+
+import math
+from urllib.parse import quote_plus
+
+RADIO_JWT_SECRET = os.environ.get("RADIO_JWT_SECRET", "change-me-in-production-kl-radio")
+RADIO_TOKEN_TTL = 2 * 86400  # 2 days
+RADIO_REPORT_THRESHOLD = int(os.environ.get("RADIO_REPORT_THRESHOLD", "8"))
+RADIO_ADD_COOLDOWN_SEC = 600  # 10 minutes between song additions per student
+RADIO_MAX_USER_QUEUE = 2      # Max active songs in queue per student
+RADIO_ANTI_REPEAT_SEC = 2700  # 45 minutes anti-repeat window
+
+_radio_advance_lock = asyncio.Lock()
+
+# ------------------ Radio In-Memory State & Fallback ------------------
+_mem_radio_state = {
+    "track": None,         # dict or None
+    "started_at": 0,       # epoch ms
+    "status": "idle",      # "playing" | "idle"
+    "reports": [],         # list of user_ids who reported current track
+}
+_mem_radio_queue = []      # list of dicts
+_mem_radio_history = []    # list of dicts: {"videoId", "title", "artist", "added_by", "played_at"}
+_mem_radio_cooldowns = {}  # user_id -> float (last add epoch)
+_verified_students_cache = {}  # user_id -> float (last verified epoch)
+
+def create_radio_jwt(payload: dict, ttl: int = RADIO_TOKEN_TTL) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    now = int(time.time())
+    body = {**payload, "iat": now, "exp": now + ttl}
+    h = _b64url_encode(json.dumps(header, separators=(",", ":")).encode())
+    p = _b64url_encode(json.dumps(body, separators=(",", ":")).encode())
+    sig = _b64url_encode(hmac.new(RADIO_JWT_SECRET.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest())
+    return f"{h}.{p}.{sig}"
+
+def verify_radio_jwt(token: str) -> dict:
+    try:
+        h, p, sig = token.split(".")
+        expected = _b64url_encode(
+            hmac.new(RADIO_JWT_SECRET.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest()
+        )
+        if not hmac.compare_digest(sig, expected):
+            raise HTTPException(status_code=401, detail="Invalid radio token signature.")
+        payload = json.loads(_b64url_decode(p))
+        if int(time.time()) > payload.get("exp", 0):
+            raise HTTPException(status_code=401, detail="Radio token expired. Re-authenticate.")
+        return payload
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Malformed radio token.")
+
+# ------------------ Radio Student Auth Helper ------------------
+async def _extract_radio_user(
+    request: Request,
+    username: str = Form(default=""),
+    password: str = Form(default=""),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
+    server_id: str = Form(default="erp3"),
+) -> str:
+    """Authenticates the student via Bearer JWT or directly via ERP credentials/session."""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+        payload = verify_radio_jwt(token)
+        user_id = payload.get("userId", "")
+        if user_id:
+            return str(user_id)
+
+    if username:
+        clean_user = username.strip()
+        now = time.time()
+        # Fast path if student verified recently (last 24 hours)
+        if _verified_students_cache.get(clean_user, 0) > now - 86400:
+            return clean_user
+
+        # Authenticate against ERP
+        seed_cookies = {
+            "_csrf": unquote(csrf_cookie) if csrf_cookie else "",
+            "PHPSESSID": php_sess_id,
+            "kl_erp_device_id": unquote(device_id) if device_id else "",
+            "SERVERID": server_id,
+        }
+        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS, http2=True) as client:
+            login_resp, _ = await auto_login(client, clean_user, password, seed_cookies=seed_cookies)
+            if is_login_failed(login_resp):
+                raise HTTPException(status_code=401, detail="Invalid university credentials for radio access.")
+
+        _verified_students_cache[clean_user] = now
+        return clean_user
+
+    raise HTTPException(status_code=401, detail="Authentication required. Provide Authorization Bearer token or student credentials.")
+
+# ------------------ Zero-API-Key YouTube Music Search ------------------
+def _parse_yt_duration(dur_str: str) -> int:
+    try:
+        parts = dur_str.strip().split(":")
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+        elif len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    except Exception:
+        pass
+    return 0
+
+async def search_youtube_music_no_key(query: str, limit: int = 15) -> list[dict]:
+    """Scrapes YouTube search results without needing any Google/YouTube API key."""
+    clean_query = query.strip()
+    if not clean_query:
+        return []
+
+    # sp=EgIQAQ%253D%253D filters results to videos only
+    search_url = f"https://www.youtube.com/results?search_query={quote_plus(clean_query)}&sp=EgIQAQ%253D%253D"
+    headers = {
+        "User-Agent": DEFAULT_HEADERS["User-Agent"],
+        "Accept-Language": "en-US,en;q=0.9,te;q=0.8,hi;q=0.7",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    try:
+        async with httpx.AsyncClient(verify=False, headers=headers, follow_redirects=True, timeout=12) as client:
+            resp = await client.get(search_url)
+            html = resp.text
+
+        match = re.search(r'var ytInitialData = ({.*?});</script>', html)
+        if not match:
+            match = re.search(r'ytInitialData\s*=\s*({.+?});', html)
+        if not match:
+            logger.warning("[RADIO SEARCH] Could not find ytInitialData in response.")
+            return []
+
+        data = json.loads(match.group(1))
+        videos = []
+        sections = (
+            data.get("contents", {})
+            .get("twoColumnSearchResultsRenderer", {})
+            .get("primaryContents", {})
+            .get("sectionListRenderer", {})
+            .get("contents", [])
+        )
+
+        for sec in sections:
+            item_sec = sec.get("itemSectionRenderer", {})
+            for item in item_sec.get("contents", []):
+                if "videoRenderer" in item:
+                    vr = item["videoRenderer"]
+                    vid = vr.get("videoId")
+                    title_runs = vr.get("title", {}).get("runs", [])
+                    title = title_runs[0].get("text", "") if title_runs else ""
+                    owner_runs = vr.get("ownerText", {}).get("runs", [])
+                    channel = owner_runs[0].get("text", "") if owner_runs else "Unknown Artist"
+                    dur_text = vr.get("lengthText", {}).get("simpleText", "")
+                    dur_sec = _parse_yt_duration(dur_text) if dur_text else 0
+                    thumbs = vr.get("thumbnail", {}).get("thumbnails", [])
+                    thumb = thumbs[-1].get("url", "") if thumbs else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+
+                    # Duration filtering: 60s (1 min) to 600s (10 min) bounds per spec
+                    if vid and title and 60 <= dur_sec <= 600:
+                        videos.append({
+                            "videoId": vid,
+                            "title": title,
+                            "artist": channel,
+                            "duration_sec": dur_sec,
+                            "duration_text": dur_text,
+                            "thumbnail": thumb,
+                        })
+                        if len(videos) >= limit:
+                            break
+            if len(videos) >= limit:
+                break
+
+        return videos
+    except Exception as e:
+        logger.error(f"[RADIO SEARCH] Scrape error for query '{query}': {e}", exc_info=True)
+        return []
+
+# ------------------ Radio DB & Persistence Helpers ------------------
+def _get_radio_state_doc() -> dict:
+    if _radio_state_col is not None:
+        try:
+            doc = _radio_state_col.find_one({"_id": "current_state"})
+            if doc:
+                return doc
+        except Exception as e:
+            logger.error(f"[RADIO] Mongo state read error: {e}")
+    return _mem_radio_state
+
+def _save_radio_state_doc(state: dict):
+    global _mem_radio_state
+    _mem_radio_state = state
+    if _radio_state_col is not None:
+        try:
+            _radio_state_col.replace_one(
+                {"_id": "current_state"},
+                {"_id": "current_state", **state},
+                upsert=True
+            )
+        except Exception as e:
+            logger.error(f"[RADIO] Mongo state save error: {e}")
+
+def _get_radio_queue_docs() -> list[dict]:
+    if _radio_queue_col is not None:
+        try:
+            return list(_radio_queue_col.find({}, {"_id": 0}))
+        except Exception as e:
+            logger.error(f"[RADIO] Mongo queue read error: {e}")
+    return list(_mem_radio_queue)
+
+def _add_radio_queue_doc(item: dict):
+    if _radio_queue_col is not None:
+        try:
+            _radio_queue_col.insert_one({**item})
+        except Exception as e:
+            logger.error(f"[RADIO] Mongo queue insert error: {e}")
+    _mem_radio_queue.append(item)
+
+def _remove_radio_queue_doc(queue_id: str):
+    global _mem_radio_queue
+    if _radio_queue_col is not None:
+        try:
+            _radio_queue_col.delete_one({"queue_id": queue_id})
+        except Exception as e:
+            logger.error(f"[RADIO] Mongo queue delete error: {e}")
+    _mem_radio_queue = [q for q in _mem_radio_queue if q.get("queue_id") != queue_id]
+
+def _update_radio_queue_votes(queue_id: str, votes: list[str]):
+    global _mem_radio_queue
+    if _radio_queue_col is not None:
+        try:
+            _radio_queue_col.update_one({"queue_id": queue_id}, {"$set": {"votes": votes}})
+        except Exception as e:
+            logger.error(f"[RADIO] Mongo queue vote update error: {e}")
+    for q in _mem_radio_queue:
+        if q.get("queue_id") == queue_id:
+            q["votes"] = votes
+            break
+
+def _add_radio_history_doc(item: dict):
+    hist_entry = {
+        "videoId": item.get("videoId"),
+        "title": item.get("title"),
+        "artist": item.get("artist"),
+        "added_by": item.get("added_by"),
+        "played_at": time.time(),
+    }
+    if _radio_history_col is not None:
+        try:
+            _radio_history_col.insert_one(hist_entry)
+        except Exception as e:
+            logger.error(f"[RADIO] Mongo history insert error: {e}")
+    _mem_radio_history.append(hist_entry)
+
+def _get_recent_radio_history(since_sec: int = RADIO_ANTI_REPEAT_SEC) -> list[dict]:
+    cutoff = time.time() - since_sec
+    if _radio_history_col is not None:
+        try:
+            return list(_radio_history_col.find({"played_at": {"$gte": cutoff}}, {"_id": 0}))
+        except Exception as e:
+            logger.error(f"[RADIO] Mongo history read error: {e}")
+    return [h for h in _mem_radio_history if h.get("played_at", 0) >= cutoff]
+
+def _check_and_update_cooldown(user_id: str) -> tuple[bool, int]:
+    """Returns (is_allowed, remaining_cooldown_seconds)."""
+    now = time.time()
+    last_add = 0.0
+    if _radio_cooldowns_col is not None:
+        try:
+            doc = _radio_cooldowns_col.find_one({"user_id": user_id})
+            if doc:
+                last_add = doc.get("last_add", 0.0)
+        except Exception as e:
+            logger.error(f"[RADIO] Mongo cooldown read error: {e}")
+    else:
+        last_add = _mem_radio_cooldowns.get(user_id, 0.0)
+
+    elapsed = now - last_add
+    if elapsed < RADIO_ADD_COOLDOWN_SEC:
+        return False, int(RADIO_ADD_COOLDOWN_SEC - elapsed)
+
+    # Update cooldown
+    if _radio_cooldowns_col is not None:
+        try:
+            _radio_cooldowns_col.update_one(
+                {"user_id": user_id},
+                {"$set": {"user_id": user_id, "last_add": now}},
+                upsert=True
+            )
+        except Exception as e:
+            logger.error(f"[RADIO] Mongo cooldown save error: {e}")
+    _mem_radio_cooldowns[user_id] = now
+    return True, 0
+
+# ------------------ Time-Decayed Queue Scoring & Weighted Lottery ------------------
+def _calculate_decayed_score(item: dict, now: float = None) -> float:
+    """Calculates time-decayed score: (votes + 1) / (hours_since_added + 1)^1.5"""
+    if now is None:
+        now = time.time()
+    added_at = float(item.get("added_at", now))
+    hours_since_added = max(0.0, (now - added_at) / 3600.0)
+    votes_count = len(item.get("votes", []))
+    score = (votes_count + 1.0) / math.pow(hours_since_added + 1.0, 1.5)
+    return round(score, 4)
+
+async def _advance_radio_track(force: bool = False) -> dict:
+    """Picks the next track via weighted lottery from top ~10 scored items with anti-repeat rules."""
+    async with _radio_advance_lock:
+        state = _get_radio_state_doc()
+        now_ms = int(time.time() * 1000)
+        now_sec = time.time()
+
+        current_track = state.get("track")
+        if current_track and not force:
+            duration_ms = int(current_track.get("duration_sec", 0)) * 1000
+            started_at = int(state.get("started_at", 0))
+            if now_ms - started_at < duration_ms:
+                # Track is still playing, do not advance
+                return state
+
+        queue = _get_radio_queue_docs()
+        if not queue:
+            # Queue is empty, radio goes idle
+            new_state = {
+                "track": None,
+                "started_at": 0,
+                "status": "idle",
+                "reports": [],
+            }
+            _save_radio_state_doc(new_state)
+            logger.info("[RADIO] Queue is empty. Radio is now idle.")
+            return new_state
+
+        # Compute score for all items in queue
+        for item in queue:
+            item["score"] = _calculate_decayed_score(item, now_sec)
+
+        # Sort descending by score
+        queue.sort(key=lambda x: x["score"], reverse=True)
+        top_pool = queue[:10]
+
+        # Anti-repeat check: avoid same artist or submitter in last 45 minutes
+        recent_history = _get_recent_radio_history(since_sec=RADIO_ANTI_REPEAT_SEC)
+        recent_artists = {h.get("artist", "").strip().lower() for h in recent_history if h.get("artist")}
+        recent_submitters = {h.get("added_by", "").strip() for h in recent_history if h.get("added_by")}
+
+        eligible_pool = [
+            item for item in top_pool
+            if item.get("artist", "").strip().lower() not in recent_artists
+            and item.get("added_by", "").strip() not in recent_submitters
+        ]
+
+        # If all candidates in top 10 violate anti-repeat, fallback to top_pool
+        pool_to_draw = eligible_pool if eligible_pool else top_pool
+        weights = [max(0.01, item["score"]) for item in pool_to_draw]
+
+        # Weighted random pick
+        chosen = random.choices(pool_to_draw, weights=weights, k=1)[0]
+
+        # Remove chosen from queue
+        _remove_radio_queue_doc(chosen["queue_id"])
+
+        # Add to history
+        _add_radio_history_doc(chosen)
+
+        # Set as current track
+        new_state = {
+            "track": {
+                "videoId": chosen["videoId"],
+                "title": chosen["title"],
+                "artist": chosen["artist"],
+                "duration_sec": chosen["duration_sec"],
+                "duration_text": chosen.get("duration_text", ""),
+                "thumbnail": chosen.get("thumbnail", ""),
+                "added_by": chosen.get("added_by", "anonymous"),
+            },
+            "started_at": now_ms,
+            "status": "playing",
+            "reports": [],
+        }
+        _save_radio_state_doc(new_state)
+        logger.info(f"[RADIO] 🎵 Now playing: '{chosen['title']}' by {chosen['artist']} (queued by {chosen.get('added_by')})")
+        return new_state
+
+async def _get_current_radio_state(user_id: str = "") -> dict:
+    """Returns the synchronized radio state, automatically advancing if the track finished."""
+    state = _get_radio_state_doc()
+    now_ms = int(time.time() * 1000)
+
+    # Check if currently playing track has ended
+    if state.get("status") == "playing" and state.get("track"):
+        duration_ms = int(state["track"].get("duration_sec", 0)) * 1000
+        started_at = int(state.get("started_at", 0))
+        if now_ms - started_at >= duration_ms:
+            state = await _advance_radio_track(force=False)
+
+    # Format queue with score and user vote indicator
+    queue = _get_radio_queue_docs()
+    now_sec = time.time()
+    for item in queue:
+        item["score"] = _calculate_decayed_score(item, now_sec)
+        item["votes_count"] = len(item.get("votes", []))
+        item["user_voted"] = bool(user_id and user_id in item.get("votes", []))
+
+    queue.sort(key=lambda x: x["score"], reverse=True)
+
+    elapsed_ms = 0
+    if state.get("status") == "playing" and state.get("started_at"):
+        elapsed_ms = max(0, now_ms - int(state["started_at"]))
+
+    return {
+        "success": True,
+        "server_time": now_ms,
+        "status": state.get("status", "idle"),
+        "started_at": state.get("started_at", 0),
+        "elapsed_ms": elapsed_ms,
+        "current_track": state.get("track"),
+        "reports_count": len(state.get("reports", [])),
+        "queue": queue,
+    }
+
+# ============================================================
+# RADIO ENDPOINTS
+# ============================================================
+
+@app.post("/api/radio/auth")
+@app.post("/radio/auth")
+async def radio_auth(
+    username: str = Form(...),
+    password: str = Form(...),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
+    server_id: str = Form(default="erp3"),
+):
+    """Verifies student identity against university ERP and issues a 30-day signed radio JWT."""
+    clean_user = username.strip()
+    seed_cookies = {
+        "_csrf": unquote(csrf_cookie) if csrf_cookie else "",
+        "PHPSESSID": php_sess_id,
+        "kl_erp_device_id": unquote(device_id) if device_id else "",
+        "SERVERID": server_id,
+    }
+
+    try:
+        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS, http2=True) as client:
+            login_resp, _ = await auto_login(client, clean_user, password, seed_cookies=seed_cookies)
+            if is_login_failed(login_resp):
+                raise HTTPException(status_code=401, detail="Invalid ERP login credentials.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[RADIO AUTH] ERP connection fault: {e}")
+        raise HTTPException(status_code=503, detail="University portal unreachable for verification.")
+
+    _verified_students_cache[clean_user] = time.time()
+    token = create_radio_jwt({"userId": clean_user, "isVerified": True})
+    logger.info(f"[RADIO] Issued radio JWT for student {clean_user}")
+    return {
+        "success": True,
+        "token": token,
+        "userId": clean_user,
+        "expiresIn": RADIO_TOKEN_TTL,
+    }
+
+@app.get("/api/radio/search")
+@app.post("/api/radio/search")
+@app.get("/radio/search")
+@app.post("/radio/search")
+async def radio_search(q: str = ""):
+    """Searches YouTube directly for songs (duration 1-10 min) with zero API key required."""
+    if not q or len(q.strip()) < 2:
+        raise HTTPException(status_code=400, detail="Search query must be at least 2 characters.")
+    results = await search_youtube_music_no_key(q, limit=15)
+    return {"success": True, "query": q, "results": results}
+
+@app.get("/api/radio/state")
+@app.get("/radio/state")
+async def radio_state(request: Request):
+    """Returns synchronized state (current track, server_time, elapsed_ms, queue)."""
+    user_id = ""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        try:
+            payload = verify_radio_jwt(auth_header[7:].strip())
+            user_id = payload.get("userId", "")
+        except Exception:
+            pass
+    return await _get_current_radio_state(user_id=user_id)
+
+@app.post("/api/radio/queue")
+@app.post("/radio/queue")
+async def radio_add_queue(
+    request: Request,
+    videoId: str = Form(...),
+    title: str = Form(...),
+    artist: str = Form(...),
+    duration_sec: int = Form(...),
+    duration_text: str = Form(default=""),
+    thumbnail: str = Form(default=""),
+    username: str = Form(default=""),
+    password: str = Form(default=""),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
+    server_id: str = Form(default="erp3"),
+):
+    """Adds a song to the radio queue (enforces 10-min cooldown, max 2 active songs per student)."""
+    user_id = await _extract_radio_user(
+        request, username=username, password=password, php_sess_id=php_sess_id,
+        csrf_cookie=csrf_cookie, device_id=device_id, server_id=server_id
+    )
+
+    # Sanity checks
+    if duration_sec < 60 or duration_sec > 600:
+        raise HTTPException(status_code=400, detail="Song duration must be between 1 and 10 minutes.")
+
+    # Check cooldown (1 add per 10 minutes per student)
+    allowed, remaining = _check_and_update_cooldown(user_id)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Cooldown active: please wait {remaining // 60}m {remaining % 60}s before queuing another song."
+        )
+
+    # Check active queue limit per user (max 2)
+    current_queue = _get_radio_queue_docs()
+    user_queued_count = sum(1 for q in current_queue if q.get("added_by") == user_id)
+    if user_queued_count >= RADIO_MAX_USER_QUEUE:
+        raise HTTPException(
+            status_code=429,
+            detail=f"You already have {user_queued_count} songs in the queue. Wait for them to play first."
+        )
+
+    # Check if song is already in queue
+    if any(q.get("videoId") == videoId for q in current_queue):
+        raise HTTPException(status_code=400, detail="This song is already in the queue.")
+
+    queue_item = {
+        "queue_id": secrets.token_hex(12),
+        "videoId": videoId.strip(),
+        "title": title.strip(),
+        "artist": artist.strip(),
+        "duration_sec": int(duration_sec),
+        "duration_text": duration_text.strip() or f"{duration_sec // 60}:{duration_sec % 60:02d}",
+        "thumbnail": thumbnail.strip() or f"https://i.ytimg.com/vi/{videoId}/hqdefault.jpg",
+        "added_by": user_id,
+        "added_at": time.time(),
+        "votes": [user_id],  # Submitter automatically upvotes
+    }
+
+    _add_radio_queue_doc(queue_item)
+    logger.info(f"[RADIO] {user_id} queued '{title}' ({videoId})")
+
+    # If radio is idle, start playing immediately!
+    state = _get_radio_state_doc()
+    if state.get("status") != "playing" or not state.get("track"):
+        await _advance_radio_track(force=True)
+
+    return await _get_current_radio_state(user_id=user_id)
+
+@app.post("/api/radio/vote")
+@app.post("/radio/vote")
+async def radio_vote(
+    request: Request,
+    queue_id: str = Form(...),
+    username: str = Form(default=""),
+    password: str = Form(default=""),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
+    server_id: str = Form(default="erp3"),
+):
+    """Upvotes a song in the queue (1 vote per song per student ID)."""
+    user_id = await _extract_radio_user(
+        request, username=username, password=password, php_sess_id=php_sess_id,
+        csrf_cookie=csrf_cookie, device_id=device_id, server_id=server_id
+    )
+
+    queue = _get_radio_queue_docs()
+    target_item = next((q for q in queue if q.get("queue_id") == queue_id), None)
+    if not target_item:
+        raise HTTPException(status_code=404, detail="Song not found in queue.")
+
+    votes = target_item.get("votes", [])
+    if user_id in votes:
+        raise HTTPException(status_code=400, detail="You have already voted for this song.")
+
+    votes.append(user_id)
+    _update_radio_queue_votes(queue_id, votes)
+    logger.info(f"[RADIO] {user_id} upvoted {target_item.get('title')} (total votes: {len(votes)})")
+
+    return await _get_current_radio_state(user_id=user_id)
+
+@app.post("/api/radio/report")
+@app.post("/radio/report")
+async def radio_report(
+    request: Request,
+    reason: str = Form(default="inappropriate"),
+    username: str = Form(default=""),
+    password: str = Form(default=""),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
+    server_id: str = Form(default="erp3"),
+):
+    """Reports currently playing track. Force-skips when threshold (>= 3) is reached."""
+    user_id = await _extract_radio_user(
+        request, username=username, password=password, php_sess_id=php_sess_id,
+        csrf_cookie=csrf_cookie, device_id=device_id, server_id=server_id
+    )
+
+    state = _get_radio_state_doc()
+    if state.get("status") != "playing" or not state.get("track"):
+        raise HTTPException(status_code=400, detail="No track is currently playing to report.")
+
+    reports = state.get("reports", [])
+    if user_id in reports:
+        raise HTTPException(status_code=400, detail="You have already reported this track.")
+
+    reports.append(user_id)
+    state["reports"] = reports
+    _save_radio_state_doc(state)
+
+    logger.warning(f"[RADIO REPORT] {user_id} reported current track '{state['track']['title']}' (reports: {len(reports)}/{RADIO_REPORT_THRESHOLD})")
+
+    # Threshold reached -> force-skip
+    if len(reports) >= RADIO_REPORT_THRESHOLD:
+        logger.info(f"[RADIO] Report threshold reached ({len(reports)}). Force-skipping track...")
+        await _advance_radio_track(force=True)
+
+    return await _get_current_radio_state(user_id=user_id)
+
+@app.post("/api/radio/advance")
+@app.post("/radio/advance")
+async def radio_advance():
+    """Advances to the next track if the current song has completed."""
+    await _advance_radio_track(force=False)
+    return await _get_current_radio_state()
+
