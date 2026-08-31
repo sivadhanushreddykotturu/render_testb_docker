@@ -1852,7 +1852,7 @@ async def _extract_radio_user(
             "kl_erp_device_id": unquote(device_id) if device_id else "",
             "SERVERID": server_id,
         }
-        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS, http2=True) as client:
+        async with httpx.AsyncClient(verify=False, headers=DEFAULT_HEADERS, http2=True) as client:
             login_resp, _ = await auto_login(client, clean_user, password, seed_cookies=seed_cookies)
             if is_login_failed(login_resp):
                 raise HTTPException(status_code=401, detail="Invalid university credentials for radio access.")
@@ -1949,21 +1949,25 @@ async def search_youtube_music_no_key(query: str, limit: int = 15) -> list[dict]
 def _get_radio_state_doc() -> dict:
     if _radio_state_col is not None:
         try:
-            doc = _radio_state_col.find_one({"_id": "current_state"})
+            doc = _radio_state_col.find_one({"_id": "current_state"}, {"_id": 0})
             if doc:
                 return doc
         except Exception as e:
             logger.error(f"[RADIO] Mongo state read error: {e}")
-    return _mem_radio_state
+    state = dict(_mem_radio_state)
+    state.pop("_id", None)
+    return state
 
 def _save_radio_state_doc(state: dict):
     global _mem_radio_state
-    _mem_radio_state = state
+    clean_state = dict(state)
+    clean_state.pop("_id", None)
+    _mem_radio_state = clean_state
     if _radio_state_col is not None:
         try:
             _radio_state_col.replace_one(
                 {"_id": "current_state"},
-                {"_id": "current_state", **state},
+                {"_id": "current_state", **clean_state},
                 upsert=True
             )
         except Exception as e:
@@ -1975,15 +1979,22 @@ def _get_radio_queue_docs() -> list[dict]:
             return list(_radio_queue_col.find({}, {"_id": 0}))
         except Exception as e:
             logger.error(f"[RADIO] Mongo queue read error: {e}")
-    return list(_mem_radio_queue)
+    clean_list = []
+    for q in _mem_radio_queue:
+        item = dict(q)
+        item.pop("_id", None)
+        clean_list.append(item)
+    return clean_list
 
 def _add_radio_queue_doc(item: dict):
+    clean_item = dict(item)
+    clean_item.pop("_id", None)
     if _radio_queue_col is not None:
         try:
-            _radio_queue_col.insert_one({**item})
+            _radio_queue_col.insert_one(dict(clean_item))
         except Exception as e:
             logger.error(f"[RADIO] Mongo queue insert error: {e}")
-    _mem_radio_queue.append(item)
+    _mem_radio_queue.append(clean_item)
 
 def _remove_radio_queue_doc(queue_id: str):
     global _mem_radio_queue
@@ -2016,7 +2027,7 @@ def _add_radio_history_doc(item: dict):
     }
     if _radio_history_col is not None:
         try:
-            _radio_history_col.insert_one(hist_entry)
+            _radio_history_col.insert_one(dict(hist_entry))
         except Exception as e:
             logger.error(f"[RADIO] Mongo history insert error: {e}")
     _mem_radio_history.append(hist_entry)
@@ -2212,7 +2223,7 @@ async def radio_auth(
     }
 
     try:
-        async with httpx.AsyncClient(verify=False, limits=limits_pool, headers=DEFAULT_HEADERS, http2=True) as client:
+        async with httpx.AsyncClient(verify=False, headers=DEFAULT_HEADERS, http2=True) as client:
             login_resp, _ = await auto_login(client, clean_user, password, seed_cookies=seed_cookies)
             if is_login_failed(login_resp):
                 raise HTTPException(status_code=401, detail="Invalid ERP login credentials.")
