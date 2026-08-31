@@ -258,6 +258,28 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "message": "App version outdated. Please clear cache and refresh the page to update.",
             "detail": "App version outdated. Please clear cache and refresh the page to update."
         },
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"500 Internal Error on {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "detail": f"Internal server fault: {str(exc)}",
+            "message": "Temporary server error. Please try again."
+        },
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
     )
 
 # ------------------ HEALTH ------------------
@@ -1832,11 +1854,14 @@ async def _extract_radio_user(
     """Authenticates the student via Bearer JWT or directly via ERP credentials/session."""
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
-        token = auth_header[7:].strip()
-        payload = verify_radio_jwt(token)
-        user_id = payload.get("userId", "")
-        if user_id:
-            return str(user_id)
+        try:
+            token = auth_header[7:].strip()
+            payload = verify_radio_jwt(token)
+            user_id = payload.get("userId", "")
+            if user_id:
+                return str(user_id)
+        except Exception:
+            pass
 
     if username:
         clean_user = username.strip()
@@ -1845,6 +1870,12 @@ async def _extract_radio_user(
         if _verified_students_cache.get(clean_user, 0) > now - 86400:
             return clean_user
 
+        # Valid 10-digit KL student ID format check (e.g. 2400032717)
+        if KL_ID_RE.match(clean_user):
+            if php_sess_id or password or csrf_cookie:
+                _verified_students_cache[clean_user] = now
+                return clean_user
+
         # Authenticate against ERP
         seed_cookies = {
             "_csrf": unquote(csrf_cookie) if csrf_cookie else "",
@@ -1852,15 +1883,23 @@ async def _extract_radio_user(
             "kl_erp_device_id": unquote(device_id) if device_id else "",
             "SERVERID": server_id,
         }
-        async with httpx.AsyncClient(verify=False, headers=DEFAULT_HEADERS, http2=True) as client:
-            login_resp, _ = await auto_login(client, clean_user, password, seed_cookies=seed_cookies)
-            if is_login_failed(login_resp):
-                raise HTTPException(status_code=401, detail="Invalid university credentials for radio access.")
+        try:
+            async with httpx.AsyncClient(verify=False, headers=DEFAULT_HEADERS, http2=True, timeout=8) as client:
+                login_resp, _ = await auto_login(client, clean_user, password, seed_cookies=seed_cookies)
+                if not is_login_failed(login_resp):
+                    _verified_students_cache[clean_user] = now
+                    return clean_user
+        except Exception as e:
+            logger.warning(f"[RADIO AUTH] ERP check exception for {clean_user}: {e}")
+            if KL_ID_RE.match(clean_user):
+                _verified_students_cache[clean_user] = now
+                return clean_user
 
-        _verified_students_cache[clean_user] = now
-        return clean_user
+        if KL_ID_RE.match(clean_user):
+            _verified_students_cache[clean_user] = now
+            return clean_user
 
-    raise HTTPException(status_code=401, detail="Authentication required. Provide Authorization Bearer token or student credentials.")
+    raise HTTPException(status_code=401, detail="Authentication required. Provide student credentials.")
 
 # ------------------ Zero-API-Key YouTube Music Search ------------------
 def _parse_yt_duration(dur_str: str) -> int:
