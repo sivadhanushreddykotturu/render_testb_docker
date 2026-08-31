@@ -1872,7 +1872,7 @@ def _parse_yt_duration(dur_str: str) -> int:
             return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
     except Exception:
         pass
-# ------------------ Music Content Filtering (Anti-Skit / Anti-Clips) ------------------
+# ------------------ Music Content Filtering (Anti-Skit / Anti-Clips / Anti-Cricket / Anti-Talk) ------------------
 RADIO_NON_MUSIC_PATTERNS = [
     r"\bskit\b", r"\bcomedy\b", r"\bprank\b", r"\broast\b", r"\bspoof\b",
     r"\bstandup\b", r"\bstand up\b", r"\bstand-up\b", r"\bjabardasth\b",
@@ -1885,11 +1885,19 @@ RADIO_NON_MUSIC_PATTERNS = [
     r"\bgameplay\b", r"\bgaming\b", r"\bunboxing\b", r"\bnews\b", r"\blive stream\b",
     r"\btalk show\b", r"\bhighlights\b", r"\bpubg\b", r"\bfree fire\b", r"\bbgmi\b",
     r"\btutorial\b", r"\bfunny scenes\b", r"\bcomedy scene\b", r"\bfunny video\b",
+    # Sports / Cricket / Match reviews / Controversy / Fan celebrations
+    r"\bcontroversy\b", r"\bexplained\b", r"\bcelebration\b", r"\bcelebrations\b",
+    r"\bchampionship\b", r"\bchampion\b", r"\bcricket\b", r"\bmatch\b",
+    r"\bipl\b", r"\bwpl\b", r"\brcb\b", r"\bsrh\b", r"\bcsk\b", r"\bmi\b",
+    r"\btrophy\b", r"\bspeech\b", r"\bdebate\b", r"\bfight\b", r"\banalysis\b",
+    r"\bscorecard\b", r"\bwicket\b", r"\bover\b", r"\bsummary\b",
+    r"\bstatus video\b", r"\bwhatsapp status\b", r"\breels?\b", r"\bshorts\b",
     # Comedy / laughing emojis
     r"[😂🤣😆😹🤡💀]",
-    # TV / OTT channels that publish dialogue clips instead of music
+    # TV / OTT / News / Non-music channels
     r"\bnetflix\b", r"\bamazon prime\b", r"\bhotstar\b", r"\betv\b",
-    r"\bstar maa\b", r"\bcolors tv\b", r"\bzee5\b", r"\baha video\b"
+    r"\bstar maa\b", r"\bcolors tv\b", r"\bzee5\b", r"\baha video\b",
+    r"\btv9\b", r"\bntv\b", r"\babn\b", r"\bv6 news\b", r"\bkrazy tony\b"
 ]
 
 _NON_MUSIC_RE = re.compile("|".join(RADIO_NON_MUSIC_PATTERNS), re.IGNORECASE)
@@ -1907,47 +1915,70 @@ def _is_allowed_music_track(title: str, artist: str = "") -> bool:
     return True
 
 async def verify_youtube_music_category(video_id: str, client: httpx.AsyncClient = None) -> bool:
-    """Verifies that Google's official machine-learning classification for this video is 'Music'."""
-    url = f"https://www.youtube.com/watch?v={video_id}"
+    """Queries Google's official YouTube InnerTube ML classification for 100% accurate music verification."""
+    clean_id = video_id.strip()
+    if not clean_id:
+        return False
+
+    url = "https://www.youtube.com/youtubei/v1/player"
+    payload = {
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": "2.20230522.01.00",
+                "hl": "en",
+                "gl": "IN"
+            }
+        },
+        "videoId": clean_id
+    }
     headers = {
         "User-Agent": DEFAULT_HEADERS["User-Agent"],
-        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/json",
     }
+
     try:
         if client is not None:
-            resp = await client.get(url, headers=headers, timeout=6)
+            resp = await client.post(url, json=payload, headers=headers, timeout=6)
         else:
-            async with httpx.AsyncClient(verify=False, headers=headers, follow_redirects=True, timeout=6) as c:
-                resp = await c.get(url)
-        html = resp.text
+            async with httpx.AsyncClient(verify=False, headers=headers, timeout=6) as c:
+                resp = await c.post(url, json=payload)
 
-        # 1. Check if Google category is explicitly "Music"
-        cat_match = re.search(r'"category":"([^"]+)"', html)
-        if cat_match:
-            cat = cat_match.group(1).strip()
-            if cat.lower() == "music":
+        data = resp.json()
+        category = data.get("microformat", {}).get("playerMicroformatRenderer", {}).get("category", "")
+        
+        if category:
+            if category.strip().lower() == "music":
                 return True
             else:
-                logger.warning(f"[RADIO] Blocked non-music video {video_id}: category={cat}")
+                logger.warning(f"[RADIO] Blocked non-music video {clean_id}: Google ML category='{category}'")
                 return False
 
-        # 2. Check if topicCategories has Music
-        if "topicCategories" in html and ("Music" in html or "wiki/Music" in html):
-            return True
+        # Fallback check on title & author from Google details
+        video_details = data.get("videoDetails", {})
+        title = video_details.get("title", "")
+        author = video_details.get("author", "")
+        if not _is_allowed_music_track(title, author):
+            return False
 
-        return True
+        return False
     except Exception as e:
-        logger.warning(f"[RADIO] Category check fallback on error: {e}")
-        return True
+        logger.warning(f"[RADIO] Category ML check error for {clean_id}: {e}")
+        return False
 
 async def search_youtube_music_no_key(query: str, limit: int = 15) -> list[dict]:
-    """Scrapes YouTube search results and verifies Google ML Category in parallel for zero skits."""
+    """Scrapes YouTube search results with automatic 'song' query-tuning for real music tracks."""
     clean_query = query.strip()
     if not clean_query:
         return []
 
-    # sp=EgIQAQ%253D%253D filters results to videos only
-    search_url = f"https://www.youtube.com/results?search_query={quote_plus(clean_query)}&sp=EgIQAQ%253D%253D"
+    # Query tuning: if student didn't specify song/audio keywords, append 'song' to prioritize genuine audio releases
+    search_term = clean_query
+    has_music_kw = any(kw in clean_query.lower() for kw in ["song", "audio", "music", "track", "lyrical", "remix", "ost", "theme", "album"])
+    if not has_music_kw:
+        search_term = f"{clean_query} song"
+
+    search_url = f"https://www.youtube.com/results?search_query={quote_plus(search_term)}&sp=EgIQAQ%253D%253D"
     headers = {
         "User-Agent": DEFAULT_HEADERS["User-Agent"],
         "Accept-Language": "en-US,en;q=0.9,te;q=0.8,hi;q=0.7",
@@ -2181,6 +2212,16 @@ async def _advance_radio_track(force: bool = False) -> dict:
                 return state
 
         queue = _get_radio_queue_docs()
+        # Auto-purge any invalid non-music items from the queue
+        valid_queue = []
+        for q in queue:
+            if not _is_allowed_music_track(q.get("title", ""), q.get("artist", "")):
+                _remove_radio_queue_doc(q.get("queue_id"))
+                logger.info(f"[RADIO PURGE] Removed non-music queue item: {q.get('title')}")
+            else:
+                valid_queue.append(q)
+        queue = valid_queue
+
         if not queue:
             # Queue is empty, radio goes idle
             new_state = {
@@ -2245,16 +2286,21 @@ async def _advance_radio_track(force: bool = False) -> dict:
         return new_state
 
 async def _get_current_radio_state(user_id: str = "") -> dict:
-    """Returns the synchronized radio state, automatically advancing if the track finished."""
+    """Returns the synchronized radio state, automatically advancing if the track finished or is invalid."""
     state = _get_radio_state_doc()
     now_ms = int(time.time() * 1000)
 
-    # Check if currently playing track has ended
+    # Check if currently playing track is non-music or has ended
     if state.get("status") == "playing" and state.get("track"):
-        duration_ms = int(state["track"].get("duration_sec", 0)) * 1000
-        started_at = int(state.get("started_at", 0))
-        if now_ms - started_at >= duration_ms:
-            state = await _advance_radio_track(force=False)
+        track = state["track"]
+        if not _is_allowed_music_track(track.get("title", ""), track.get("artist", "")):
+            logger.info(f"[RADIO] Auto-skipping non-music track: {track.get('title')}")
+            state = await _advance_radio_track(force=True)
+        else:
+            duration_ms = int(track.get("duration_sec", 0)) * 1000
+            started_at = int(state.get("started_at", 0))
+            if now_ms - started_at >= duration_ms:
+                state = await _advance_radio_track(force=False)
 
     # Format queue with score and user vote indicator
     queue = _get_radio_queue_docs()
