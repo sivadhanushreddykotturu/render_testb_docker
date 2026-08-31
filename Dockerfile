@@ -8,9 +8,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# curl: container healthcheck. No compilers needed — all deps ship wheels.
+# curl: container healthcheck, ffmpeg: HLS live radio streaming
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

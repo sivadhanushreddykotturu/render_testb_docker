@@ -11,3 +11,4 @@ Pillow
 pymongo[srv]
 beautifulsoup4==4.12.3
 lxml==5.1.0
+yt-dlp>=2024.0.0

@@ -1,11 +1,14 @@
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import FastAPI, Form, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import httpx
 import logging
 import os
+import sys
+import subprocess
+from pathlib import Path
 from urllib.parse import unquote, urlparse
 import json
 import numpy as np
@@ -227,6 +230,9 @@ async def lifespan(app: FastAPI):
     logger.info(
         f"🚀 {len(endpoints)} API Gateway endpoint(s) live in {GATEWAY_REGIONS}: {endpoints}"
     )
+
+    # Start HLS Live Radio background worker
+    asyncio.create_task(_hls_radio_worker_loop())
 
     yield
 
@@ -2674,4 +2680,215 @@ async def radio_advance():
     """Advances to the next track if the current song has completed."""
     await _advance_radio_track(force=False)
     return await _get_current_radio_state()
+
+# ============================================================
+# HLS LIVE RADIO STREAMING ENGINE (PERSISTENT FFMPEG + YT-DLP)
+# ============================================================
+
+HLS_DIR = Path(os.environ.get("HLS_DIR", "/tmp/hls_radio" if sys.platform != "win32" else "./hls_radio"))
+CACHE_DIR = Path(os.environ.get("RADIO_CACHE_DIR", "/tmp/radio_cache" if sys.platform != "win32" else "./radio_cache"))
+SAMPLE_RATE = 44100
+CHANNELS = 2
+CHUNK_SIZE = 17640  # 100ms PCM chunks (44100 * 2 * 2 * 0.1)
+
+_ffmpeg_hls_proc: subprocess.Popen | None = None
+_hls_current_track: dict | None = None
+
+def _ensure_hls_dirs():
+    HLS_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _download_radio_audio_track(video_id: str) -> Path | None:
+    """Pre-downloads high quality audio track from YouTube using yt-dlp to local cache."""
+    _ensure_hls_dirs()
+    target_path = CACHE_DIR / f"{video_id}.m4a"
+    if target_path.exists() and target_path.stat().st_size > 10000:
+        return target_path
+
+    logger.info(f"[HLS STREAMER] Downloading audio for videoId: {video_id}")
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--no-playlist",
+        "-f", "bestaudio[ext=m4a]/bestaudio/best",
+        "-o", str(target_path),
+        "--quiet",
+        "--no-warnings",
+        url
+    ]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
+        if proc.returncode == 0 and target_path.exists() and target_path.stat().st_size > 10000:
+            logger.info(f"[HLS STREAMER] Successfully cached {video_id} ({target_path.stat().st_size} bytes)")
+            return target_path
+        else:
+            logger.error(f"[HLS STREAMER] yt-dlp error for {video_id}: {proc.stderr.decode('utf-8', errors='ignore')}")
+    except Exception as e:
+        logger.error(f"[HLS STREAMER] Exception downloading track {video_id}: {e}")
+    return None
+
+async def _launch_persistent_ffmpeg():
+    """Starts the single persistent FFmpeg HLS encoding process reading PCM from pipe:0."""
+    global _ffmpeg_hls_proc
+    _ensure_hls_dirs()
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-re",
+        "-f", "s16le",
+        "-ar", str(SAMPLE_RATE),
+        "-ac", str(CHANNELS),
+        "-i", "pipe:0",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-f", "hls",
+        "-hls_time", "2",
+        "-hls_list_size", "5",
+        "-hls_flags", "delete_segments+append_list+omit_endlist",
+        "-hls_segment_filename", str(HLS_DIR / "seg_%05d.ts"),
+        str(HLS_DIR / "stream.m3u8"),
+    ]
+
+    try:
+        _ffmpeg_hls_proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logger.info("[HLS STREAMER] Persistent FFmpeg daemon launched successfully.")
+        return _ffmpeg_hls_proc
+    except Exception as e:
+        logger.warning(f"[HLS STREAMER] FFmpeg launch notice: {e} (Ensure FFmpeg is installed in container)")
+        return None
+
+async def _hls_radio_worker_loop():
+    """Continuous background worker feeding raw PCM chunks into persistent FFmpeg."""
+    global _ffmpeg_hls_proc, _hls_current_track
+    _ensure_hls_dirs()
+    await asyncio.sleep(2)
+
+    ffmpeg_proc = await _launch_persistent_ffmpeg()
+    if not ffmpeg_proc or not ffmpeg_proc.stdin:
+        logger.warning("[HLS STREAMER] FFmpeg not available. HLS streamer worker will retry on need.")
+        return
+
+    logger.info("[HLS STREAMER] Live HLS Radio background worker active.")
+
+    while True:
+        try:
+            queue = _get_radio_queue_docs()
+            if queue:
+                chosen_track = queue[0]
+                vid = chosen_track["videoId"]
+
+                audio_file = await asyncio.to_thread(_download_radio_audio_track, vid)
+                if audio_file and audio_file.exists():
+                    now_ms = int(time.time() * 1000)
+                    _hls_current_track = chosen_track
+                    new_state = {
+                        "track": {
+                            "videoId": chosen_track["videoId"],
+                            "title": chosen_track["title"],
+                            "artist": chosen_track["artist"],
+                            "duration_sec": chosen_track["duration_sec"],
+                            "duration_text": chosen_track.get("duration_text", ""),
+                            "thumbnail": chosen_track.get("thumbnail", ""),
+                            "added_by": chosen_track.get("added_by", "anonymous"),
+                        },
+                        "started_at": now_ms,
+                        "status": "playing",
+                        "reports": [],
+                    }
+                    _save_radio_state_doc(new_state)
+                    _remove_radio_queue_doc(chosen_track["queue_id"])
+                    _add_radio_history_doc(chosen_track)
+
+                    decode_cmd = [
+                        "ffmpeg",
+                        "-i", str(audio_file),
+                        "-f", "s16le",
+                        "-ar", str(SAMPLE_RATE),
+                        "-ac", str(CHANNELS),
+                        "-vn",
+                        "pipe:1"
+                    ]
+                    decoder_proc = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+                    while True:
+                        pcm_data = decoder_proc.stdout.read(CHUNK_SIZE)
+                        if not pcm_data:
+                            break
+                        try:
+                            ffmpeg_proc.stdin.write(pcm_data)
+                            ffmpeg_proc.stdin.flush()
+                        except (BrokenPipeError, OSError):
+                            ffmpeg_proc = await _launch_persistent_ffmpeg()
+                            break
+                        await asyncio.sleep(0.09)
+
+                    decoder_proc.wait()
+                    logger.info(f"[HLS STREAMER] Finished track: '{chosen_track.get('title')}'.")
+                else:
+                    _remove_radio_queue_doc(chosen_track["queue_id"])
+                    await asyncio.sleep(1)
+            else:
+                _hls_current_track = None
+                silent_chunk = b"\x00" * CHUNK_SIZE
+                try:
+                    ffmpeg_proc.stdin.write(silent_chunk)
+                    ffmpeg_proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    ffmpeg_proc = await _launch_persistent_ffmpeg()
+                await asyncio.sleep(0.095)
+
+        except Exception as e:
+            logger.error(f"[HLS STREAMER] Worker exception: {e}")
+            await asyncio.sleep(1)
+
+# ------------------ HLS STREAM ENDPOINTS ------------------
+
+@app.get("/api/radio/hls/stream.m3u8")
+@app.get("/radio/hls/stream.m3u8")
+async def radio_hls_manifest():
+    """Serves live HLS playlist manifest (never cached)."""
+    manifest_path = HLS_DIR / "stream.m3u8"
+    if not manifest_path.exists():
+        manifest_content = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        return Response(
+            content=manifest_content,
+            media_type="application/vnd.apple.mpegurl",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+                "Access-Control-Allow-Origin": "*",
+            }
+        )
+    return FileResponse(
+        path=str(manifest_path),
+        media_type="application/vnd.apple.mpegurl",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+            "Access-Control-Allow-Origin": "*",
+        }
+    )
+
+@app.get("/api/radio/hls/{segment_name}")
+@app.get("/radio/hls/{segment_name}")
+async def radio_hls_segment(segment_name: str):
+    """Serves 2-second HLS audio segment (edge cached by Cloudflare)."""
+    clean_seg = os.path.basename(segment_name)
+    segment_path = HLS_DIR / clean_seg
+    if not segment_path.exists():
+        raise HTTPException(status_code=404, detail="Segment not found.")
+
+    return FileResponse(
+        path=str(segment_path),
+        media_type="video/MP2T",
+        headers={
+            "Cache-Control": "public, max-age=60",
+            "Access-Control-Allow-Origin": "*",
+        }
+    )
+
 
