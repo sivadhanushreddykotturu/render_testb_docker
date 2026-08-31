@@ -2689,6 +2689,8 @@ HLS_DIR = Path(os.environ.get("HLS_DIR", "/tmp/hls_radio" if sys.platform != "wi
 CACHE_DIR = Path(os.environ.get("RADIO_CACHE_DIR", "/tmp/radio_cache" if sys.platform != "win32" else "./radio_cache"))
 SAMPLE_RATE = 44100
 CHANNELS = 2
+BYTES_PER_SAMPLE = 2  # s16le = 2 bytes per sample
+BYTES_PER_SEC = SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE  # 176,400 bytes/sec
 CHUNK_SIZE = 17640  # 100ms PCM chunks (44100 * 2 * 2 * 0.1)
 
 _ffmpeg_hls_proc: subprocess.Popen | None = None
@@ -2697,6 +2699,31 @@ _hls_current_track: dict | None = None
 def _ensure_hls_dirs():
     HLS_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _cleanup_radio_cache(max_age_sec: int = 1800):
+    """Deletes cached audio files older than max_age_sec to keep disk usage minimal."""
+    try:
+        if not CACHE_DIR.exists():
+            return
+        now = time.time()
+        for f in CACHE_DIR.glob("*.m4a"):
+            try:
+                if now - f.stat().st_mtime > max_age_sec:
+                    f.unlink(missing_ok=True)
+                    logger.info(f"[HLS CACHE CLEANUP] Removed expired audio cache: {f.name}")
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"[HLS CACHE CLEANUP] Warning during cache cleanup: {e}")
+
+async def _periodic_cache_cleaner_task():
+    """Background task running every 10 minutes to clean up stale audio files."""
+    while True:
+        try:
+            await asyncio.sleep(600)
+            await asyncio.to_thread(_cleanup_radio_cache, 1800)
+        except Exception:
+            await asyncio.sleep(60)
 
 def _download_radio_audio_track(video_id: str) -> Path | None:
     """Pre-downloads high quality audio track from YouTube using yt-dlp to local cache."""
@@ -2732,6 +2759,14 @@ async def _launch_persistent_ffmpeg():
     global _ffmpeg_hls_proc
     _ensure_hls_dirs()
 
+    # Kill stale process if exists
+    if _ffmpeg_hls_proc and _ffmpeg_hls_proc.poll() is None:
+        try:
+            _ffmpeg_hls_proc.terminate()
+            _ffmpeg_hls_proc.wait(timeout=2)
+        except Exception:
+            _ffmpeg_hls_proc.kill()
+
     cmd = [
         "ffmpeg",
         "-y",
@@ -2764,7 +2799,7 @@ async def _launch_persistent_ffmpeg():
         return None
 
 async def _hls_radio_worker_loop():
-    """Continuous background worker feeding raw PCM chunks into persistent FFmpeg."""
+    """Continuous background worker feeding raw PCM chunks into persistent FFmpeg with drift-free wall-clock pacing."""
     global _ffmpeg_hls_proc, _hls_current_track
     _ensure_hls_dirs()
     await asyncio.sleep(2)
@@ -2774,6 +2809,8 @@ async def _hls_radio_worker_loop():
         logger.warning("[HLS STREAMER] FFmpeg not available. HLS streamer worker will retry on need.")
         return
 
+    # Start periodic cache cleaner
+    asyncio.create_task(_periodic_cache_cleaner_task())
     logger.info("[HLS STREAMER] Live HLS Radio background worker active.")
 
     while True:
@@ -2816,6 +2853,9 @@ async def _hls_radio_worker_loop():
                     ]
                     decoder_proc = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
+                    # Monotonic clock accumulator for zero-drift wall-clock pacing
+                    next_chunk_time = time.monotonic()
+
                     while True:
                         pcm_data = decoder_proc.stdout.read(CHUNK_SIZE)
                         if not pcm_data:
@@ -2826,10 +2866,21 @@ async def _hls_radio_worker_loop():
                         except (BrokenPipeError, OSError):
                             ffmpeg_proc = await _launch_persistent_ffmpeg()
                             break
-                        await asyncio.sleep(0.09)
+
+                        # Drift-free pacing
+                        next_chunk_time += len(pcm_data) / BYTES_PER_SEC
+                        sleep_duration = max(0.0, next_chunk_time - time.monotonic())
+                        if sleep_duration > 0:
+                            await asyncio.sleep(sleep_duration)
 
                     decoder_proc.wait()
                     logger.info(f"[HLS STREAMER] Finished track: '{chosen_track.get('title')}'.")
+
+                    # Immediate post-play cleanup for this specific track
+                    try:
+                        audio_file.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 else:
                     _remove_radio_queue_doc(chosen_track["queue_id"])
                     await asyncio.sleep(1)
