@@ -2955,7 +2955,21 @@ def _hls_radio_worker_thread():
             logger.error(f"[HLS STREAMER] Thread exception: {e}")
             time.sleep(1)
 
+_streamer_lock_file = None
+
 def _start_hls_streamer_thread():
+    global _streamer_lock_file
+    try:
+        import fcntl
+        _streamer_lock_file = open("/tmp/radio_streamer.lock", "w")
+        fcntl.flock(_streamer_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        logger.info("[HLS STREAMER] Acquired singleton process lock. Starting streamer thread.")
+    except (ImportError, AttributeError):
+        pass
+    except (IOError, OSError):
+        logger.info("[HLS STREAMER] Another Gunicorn worker is already running the streamer. Skipping duplicate.")
+        return
+
     t = threading.Thread(target=_hls_radio_worker_thread, daemon=True, name="HlsRadioStreamerThread")
     t.start()
 
