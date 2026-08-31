@@ -1967,96 +1967,130 @@ async def verify_youtube_music_category(video_id: str, client: httpx.AsyncClient
         return False
 
 async def search_youtube_music_no_key(query: str, limit: int = 15) -> list[dict]:
-    """Scrapes YouTube search results with automatic 'song' query-tuning for real music tracks."""
+    """Searches YouTube Music via official InnerTube API (WEB_REMIX) for 100% pure music results."""
     clean_query = query.strip()
     if not clean_query:
         return []
 
-    # Query tuning: if student didn't specify song/audio keywords, append 'song' to prioritize genuine audio releases
-    search_term = clean_query
-    has_music_kw = any(kw in clean_query.lower() for kw in ["song", "audio", "music", "track", "lyrical", "remix", "ost", "theme", "album"])
-    if not has_music_kw:
-        search_term = f"{clean_query} song"
-
-    search_url = f"https://www.youtube.com/results?search_query={quote_plus(search_term)}&sp=EgIQAQ%253D%253D"
+    url = "https://music.youtube.com/youtubei/v1/search"
+    payload = {
+        "context": {
+            "client": {
+                "clientName": "WEB_REMIX",
+                "clientVersion": "1.20230522.01.00",
+                "hl": "en",
+                "gl": "IN",
+            }
+        },
+        "query": clean_query,
+        # 'params' filters search to Songs only on YouTube Music
+        "params": "EgWKAQIIAWoMEAMQBBAJEA4QChAF",
+    }
     headers = {
         "User-Agent": DEFAULT_HEADERS["User-Agent"],
-        "Accept-Language": "en-US,en;q=0.9,te;q=0.8,hi;q=0.7",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Content-Type": "application/json",
+        "Referer": "https://music.youtube.com/",
     }
 
+    results = []
     try:
-        async with httpx.AsyncClient(verify=False, headers=headers, follow_redirects=True, timeout=12) as client:
-            resp = await client.get(search_url)
-            html = resp.text
+        async with httpx.AsyncClient(verify=False, headers=headers, timeout=10) as client:
+            resp = await client.post(url, json=payload)
+            data = resp.json()
 
-            match = re.search(r'var ytInitialData = ({.*?});</script>', html)
-            if not match:
-                match = re.search(r'ytInitialData\s*=\s*({.+?});', html)
-            if not match:
-                logger.warning("[RADIO SEARCH] Could not find ytInitialData in response.")
-                return []
-
-            data = json.loads(match.group(1))
-            raw_candidates = []
             sections = (
                 data.get("contents", {})
-                .get("twoColumnSearchResultsRenderer", {})
-                .get("primaryContents", {})
+                .get("tabbedSearchResultsRenderer", {})
+                .get("tabs", [{}])[0]
+                .get("tabRenderer", {})
+                .get("content", {})
                 .get("sectionListRenderer", {})
                 .get("contents", [])
             )
 
             for sec in sections:
-                item_sec = sec.get("itemSectionRenderer", {})
-                for item in item_sec.get("contents", []):
-                    if "videoRenderer" in item:
-                        vr = item["videoRenderer"]
-                        vid = vr.get("videoId")
-                        title_runs = vr.get("title", {}).get("runs", [])
-                        title = title_runs[0].get("text", "") if title_runs else ""
-                        owner_runs = vr.get("ownerText", {}).get("runs", [])
-                        channel = owner_runs[0].get("text", "") if owner_runs else "Unknown Artist"
-                        dur_text = vr.get("lengthText", {}).get("simpleText", "")
-                        dur_sec = _parse_yt_duration(dur_text) if dur_text else 0
-                        thumbs = vr.get("thumbnail", {}).get("thumbnails", [])
-                        thumb = thumbs[-1].get("url", "") if thumbs else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+                shelf = sec.get("musicShelfRenderer", {}) or sec.get("musicCardShelfRenderer", {})
+                for content in shelf.get("contents", []):
+                    ir = content.get("musicResponsiveListItemRenderer", {})
+                    cols = ir.get("flexColumns", [])
+                    if not cols:
+                        continue
 
-                        # Initial pass: Duration (60s to 600s) + regex filter
-                        if vid and title and 60 <= dur_sec <= 600 and _is_allowed_music_track(title, channel):
-                            raw_candidates.append({
-                                "videoId": vid,
-                                "title": title,
-                                "artist": channel,
-                                "duration_sec": dur_sec,
-                                "duration_text": dur_text,
-                                "thumbnail": thumb,
-                            })
-                            if len(raw_candidates) >= limit * 2:
-                                break
-                if len(raw_candidates) >= limit * 2:
-                    break
+                    # Title
+                    title_runs = (
+                        cols[0]
+                        .get("musicResponsiveListItemFlexColumnRenderer", {})
+                        .get("text", {})
+                        .get("runs", [{}])
+                    )
+                    title = title_runs[0].get("text", "").strip() if title_runs else ""
 
-            # Parallel ML Category verification (runs all candidate checks concurrently in ~200-300ms)
-            tasks = []
-            for v in raw_candidates:
-                if v["artist"].endswith(" - Topic") or "vevo" in v["artist"].lower():
-                    tasks.append(asyncio.sleep(0, result=True))
-                else:
-                    tasks.append(verify_youtube_music_category(v["videoId"], client=client))
+                    # Artist & Duration from flex columns
+                    artist = "Unknown Artist"
+                    dur_text = "3:30"
+                    dur_sec = 210
 
-            ml_results = await asyncio.gather(*tasks, return_exceptions=True)
-            verified_videos = []
-            for v, is_music in zip(raw_candidates, ml_results):
-                if is_music is True:
-                    verified_videos.append(v)
-                    if len(verified_videos) >= limit:
+                    if len(cols) > 1:
+                        runs = [
+                            x.get("text", "").strip()
+                            for x in cols[1]
+                            .get("musicResponsiveListItemFlexColumnRenderer", {})
+                            .get("text", {})
+                            .get("runs", [])
+                            if x.get("text", "").strip() not in ["", "•", "·"]
+                        ]
+                        if runs:
+                            artist = runs[0]
+                            for x in reversed(runs):
+                                if ":" in x:
+                                    dur_text = x
+                                    p = x.split(":")
+                                    if len(p) == 2 and p[0].isdigit() and p[1].isdigit():
+                                        dur_sec = int(p[0]) * 60 + int(p[1])
+                                    elif len(p) == 3 and p[0].isdigit() and p[1].isdigit() and p[2].isdigit():
+                                        dur_sec = int(p[0]) * 3600 + int(p[1]) * 60 + int(p[2])
+                                    break
+
+                    # Video ID
+                    vid = (
+                        ir.get("playlistItemData", {}).get("videoId")
+                        or ir.get("overlay", {})
+                        .get("musicItemThumbnailOverlayRenderer", {})
+                        .get("content", {})
+                        .get("musicPlayButtonRenderer", {})
+                        .get("playNavigationEndpoint", {})
+                        .get("watchEndpoint", {})
+                        .get("videoId", "")
+                    )
+
+                    # Thumbnail
+                    thumbs = (
+                        ir.get("thumbnail", {})
+                        .get("musicThumbnailRenderer", {})
+                        .get("thumbnail", {})
+                        .get("thumbnails", [])
+                    )
+                    thumb = thumbs[-1].get("url", f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg") if thumbs else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+
+                    # Only accept songs with duration between 60s and 600s
+                    if vid and title and 60 <= dur_sec <= 600:
+                        results.append({
+                            "videoId": vid,
+                            "title": title,
+                            "artist": artist,
+                            "duration_sec": dur_sec,
+                            "duration_text": dur_text,
+                            "thumbnail": thumb,
+                        })
+
+                    if len(results) >= limit:
                         break
-
-            return verified_videos
+                if len(results) >= limit:
+                    break
     except Exception as e:
-        logger.error(f"[RADIO SEARCH] Scrape error for query '{query}': {e}", exc_info=True)
-        return []
+        logger.error(f"[RADIO YT MUSIC SEARCH] InnerTube search error: {e}")
+
+    return results
 
 # ------------------ Radio DB & Persistence Helpers ------------------
 def _get_radio_state_doc() -> dict:
