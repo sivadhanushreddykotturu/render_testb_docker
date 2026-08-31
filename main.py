@@ -2740,32 +2740,39 @@ async def _periodic_cache_cleaner_task():
             await asyncio.sleep(60)
 
 def _download_radio_audio_track(video_id: str) -> Path | None:
-    """Pre-downloads high quality audio track from YouTube using yt-dlp to local cache."""
+    """Pre-downloads high quality audio track from YouTube using yt-dlp directly."""
     _ensure_hls_dirs()
-    target_path = CACHE_DIR / f"{video_id}.m4a"
-    if target_path.exists() and target_path.stat().st_size > 10000:
-        return target_path
+    clean_vid = video_id.strip()
 
-    logger.info(f"[HLS STREAMER] Downloading audio for videoId: {video_id}")
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    cmd = [
-        sys.executable, "-m", "yt_dlp",
-        "--no-playlist",
-        "-f", "bestaudio[ext=m4a]/bestaudio/best",
-        "-o", str(target_path),
-        "--quiet",
-        "--no-warnings",
-        url
-    ]
+    # Check if already cached in any audio format
+    existing = list(CACHE_DIR.glob(f"{clean_vid}.*"))
+    for f in existing:
+        if f.is_file() and f.stat().st_size > 10000:
+            return f
+
+    logger.info(f"[HLS STREAMER] Downloading audio for videoId: {clean_vid}")
+    url = f"https://www.youtube.com/watch?v={clean_vid}"
+
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45)
-        if proc.returncode == 0 and target_path.exists() and target_path.stat().st_size > 10000:
-            logger.info(f"[HLS STREAMER] Successfully cached {video_id} ({target_path.stat().st_size} bytes)")
-            return target_path
-        else:
-            logger.error(f"[HLS STREAMER] yt-dlp error for {video_id}: {proc.stderr.decode('utf-8', errors='ignore')}")
+        import yt_dlp
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": str(CACHE_DIR / f"{clean_vid}.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        downloaded = list(CACHE_DIR.glob(f"{clean_vid}.*"))
+        for f in downloaded:
+            if f.is_file() and f.stat().st_size > 10000:
+                logger.info(f"[HLS STREAMER] Successfully cached {clean_vid} -> {f.name} ({f.stat().st_size} bytes)")
+                return f
+        logger.error(f"[HLS STREAMER] Download completed but no valid file found for {clean_vid}")
     except Exception as e:
-        logger.error(f"[HLS STREAMER] Exception downloading track {video_id}: {e}")
+        logger.error(f"[HLS STREAMER] Exception downloading track {clean_vid}: {e}")
     return None
 
 def _launch_persistent_ffmpeg():
@@ -2839,6 +2846,17 @@ def _hls_radio_worker_thread():
                         it["score"] = _calculate_decayed_score(it, now_sec)
                     queue.sort(key=lambda x: (x["score"], -x.get("added_at", 0)), reverse=True)
                     chosen_track = queue[0]
+                else:
+                    # If queue is empty, check if DB state has a track currently within its playback window
+                    state = _get_radio_state_doc()
+                    if state.get("status") == "playing" and state.get("track") and _hls_current_track is None:
+                        curr = state.get("track")
+                        now_ms = int(time.time() * 1000)
+                        started_at = int(state.get("started_at", 0))
+                        duration_ms = int(curr.get("duration_sec", 0)) * 1000
+                        if started_at > 0 and (now_ms - started_at) < duration_ms:
+                            chosen_track = curr
+                            logger.info(f"[HLS STREAMER] Resuming active track from DB: '{chosen_track.get('title')}'")
 
             if chosen_track:
                 vid = chosen_track["videoId"]
