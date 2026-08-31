@@ -2764,7 +2764,7 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
             "noplaylist": True,
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android", "ios"],
+                    "player_client": ["android"],
                     "player_skip": ["webpage", "configs"],
                 }
             },
