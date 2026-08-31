@@ -2266,19 +2266,24 @@ def _check_and_update_cooldown(user_id: str) -> tuple[bool, int]:
     _mem_radio_cooldowns[user_id] = now
     return True, 0
 
-# ------------------ Time-Decayed Queue Scoring & Weighted Lottery ------------------
+# ------------------ Fair Queue Scoring & Deterministic Selection ------------------
 def _calculate_decayed_score(item: dict, now: float = None) -> float:
-    """Calculates time-decayed score: (votes + 1) / (hours_since_added + 1)^1.5"""
+    """
+    Calculates fair priority score:
+    - Base: Raw Upvotes (each vote gives +10.0 points)
+    - Anti-Starvation Wait Bonus: +1.0 point per 5 minutes of waiting (0.2 pts/min)
+    - FIFO Tiebreaker: Submissions naturally sorted by submission time
+    """
     if now is None:
         now = time.time()
     added_at = float(item.get("added_at", now))
-    hours_since_added = max(0.0, (now - added_at) / 3600.0)
+    wait_minutes = max(0.0, (now - added_at) / 60.0)
     votes_count = len(item.get("votes", []))
-    score = (votes_count + 1.0) / math.pow(hours_since_added + 1.0, 1.5)
+    score = (votes_count * 10.0) + (wait_minutes * 0.2)
     return round(score, 4)
 
 async def _advance_radio_track(force: bool = False) -> dict:
-    """Picks the next track via weighted lottery from top ~10 scored items with anti-repeat rules."""
+    """Picks the top-ranked track deterministically (No random lottery) with soft anti-repeat rules."""
     async with _radio_advance_lock:
         state = _get_radio_state_doc()
         now_ms = int(time.time() * 1000)
@@ -2315,31 +2320,31 @@ async def _advance_radio_track(force: bool = False) -> dict:
             logger.info("[RADIO] Queue is empty. Radio is now idle.")
             return new_state
 
-        # Compute score for all items in queue
+        # Compute priority score for all items in queue
         for item in queue:
             item["score"] = _calculate_decayed_score(item, now_sec)
 
-        # Sort descending by score
-        queue.sort(key=lambda x: x["score"], reverse=True)
-        top_pool = queue[:10]
+        # Sort strictly: Highest score first; on ties, earliest submitted (added_at) first
+        queue.sort(key=lambda x: (x["score"], -x.get("added_at", 0)), reverse=True)
 
-        # Anti-repeat check: avoid same artist or submitter in last 45 minutes
+        # Anti-repeat check: avoid playing exact same artist or submitter back-to-back if other options exist
         recent_history = _get_recent_radio_history(since_sec=RADIO_ANTI_REPEAT_SEC)
         recent_artists = {h.get("artist", "").strip().lower() for h in recent_history if h.get("artist")}
         recent_submitters = {h.get("added_by", "").strip() for h in recent_history if h.get("added_by")}
 
-        eligible_pool = [
-            item for item in top_pool
-            if item.get("artist", "").strip().lower() not in recent_artists
-            and item.get("added_by", "").strip() not in recent_submitters
-        ]
+        chosen = None
+        for candidate in queue:
+            cand_artist = candidate.get("artist", "").strip().lower()
+            cand_user = candidate.get("added_by", "").strip()
+            # If queue has multiple items, skip candidate if they just played in the last track
+            if len(queue) > 1 and (cand_artist in recent_artists or cand_user in recent_submitters):
+                continue
+            chosen = candidate
+            break
 
-        # If all candidates in top 10 violate anti-repeat, fallback to top_pool
-        pool_to_draw = eligible_pool if eligible_pool else top_pool
-        weights = [max(0.01, item["score"]) for item in pool_to_draw]
-
-        # Weighted random pick
-        chosen = random.choices(pool_to_draw, weights=weights, k=1)[0]
+        # Fallback to #1 in queue if all candidates violated soft anti-repeat
+        if not chosen:
+            chosen = queue[0]
 
         # Remove chosen from queue
         _remove_radio_queue_doc(chosen["queue_id"])
@@ -2391,7 +2396,7 @@ async def _get_current_radio_state(user_id: str = "") -> dict:
         item["votes_count"] = len(item.get("votes", []))
         item["user_voted"] = bool(user_id and user_id in item.get("votes", []))
 
-    queue.sort(key=lambda x: x["score"], reverse=True)
+    queue.sort(key=lambda x: (x["score"], -x.get("added_at", 0)), reverse=True)
 
     elapsed_ms = 0
     if state.get("status") == "playing" and state.get("started_at"):
