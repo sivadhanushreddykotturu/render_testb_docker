@@ -2408,8 +2408,20 @@ async def _get_current_radio_state(user_id: str = "") -> dict:
         item["score"] = _calculate_decayed_score(item, now_sec)
         item["votes_count"] = len(item.get("votes", []))
         item["user_voted"] = bool(user_id and user_id in item.get("votes", []))
+        item["is_locked"] = bool(_next_locked_track and item.get("queue_id") == _next_locked_track.get("queue_id"))
 
-    queue.sort(key=lambda x: (x["score"], -x.get("added_at", 0)), reverse=True)
+    # If an item is locked for playback (final 30s), it stays fixed at position #1
+    if _next_locked_track:
+        locked_id = _next_locked_track.get("queue_id")
+        locked_item = next((it for it in queue if it.get("queue_id") == locked_id), None)
+        other_items = [it for it in queue if it.get("queue_id") != locked_id]
+        other_items.sort(key=lambda x: (x["score"], -x.get("added_at", 0)), reverse=True)
+        if locked_item:
+            queue = [locked_item] + other_items
+        else:
+            queue = other_items
+    else:
+        queue.sort(key=lambda x: (x["score"], -x.get("added_at", 0)), reverse=True)
 
     elapsed_ms = 0
     if state.get("status") == "playing" and state.get("started_at"):
@@ -2695,6 +2707,7 @@ CHUNK_SIZE = 17640  # 100ms PCM chunks (44100 * 2 * 2 * 0.1)
 
 _ffmpeg_hls_proc: subprocess.Popen | None = None
 _hls_current_track: dict | None = None
+_next_locked_track: dict | None = None
 
 def _ensure_hls_dirs():
     HLS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2799,8 +2812,8 @@ async def _launch_persistent_ffmpeg():
         return None
 
 async def _hls_radio_worker_loop():
-    """Continuous background worker feeding raw PCM chunks into persistent FFmpeg with drift-free wall-clock pacing."""
-    global _ffmpeg_hls_proc, _hls_current_track
+    """Continuous background worker feeding raw PCM chunks into persistent FFmpeg with drift-free wall-clock pacing and 30s pre-download locking."""
+    global _ffmpeg_hls_proc, _hls_current_track, _next_locked_track
     _ensure_hls_dirs()
     await asyncio.sleep(2)
 
@@ -2815,9 +2828,20 @@ async def _hls_radio_worker_loop():
 
     while True:
         try:
-            queue = _get_radio_queue_docs()
-            if queue:
-                chosen_track = queue[0]
+            chosen_track = None
+            if _next_locked_track:
+                chosen_track = _next_locked_track
+                _next_locked_track = None
+            else:
+                queue = _get_radio_queue_docs()
+                if queue:
+                    now_sec = time.time()
+                    for it in queue:
+                        it["score"] = _calculate_decayed_score(it, now_sec)
+                    queue.sort(key=lambda x: (x["score"], -x.get("added_at", 0)), reverse=True)
+                    chosen_track = queue[0]
+
+            if chosen_track:
                 vid = chosen_track["videoId"]
 
                 audio_file = await asyncio.to_thread(_download_radio_audio_track, vid)
@@ -2853,7 +2877,8 @@ async def _hls_radio_worker_loop():
                     ]
                     decoder_proc = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
-                    # Monotonic clock accumulator for zero-drift wall-clock pacing
+                    track_duration_sec = max(30.0, float(chosen_track.get("duration_sec", 180)))
+                    streamed_bytes = 0
                     next_chunk_time = time.monotonic()
 
                     while True:
@@ -2866,6 +2891,21 @@ async def _hls_radio_worker_loop():
                         except (BrokenPipeError, OSError):
                             ffmpeg_proc = await _launch_persistent_ffmpeg()
                             break
+
+                        streamed_bytes += len(pcm_data)
+                        streamed_sec = streamed_bytes / BYTES_PER_SEC
+                        remaining_sec = track_duration_sec - streamed_sec
+
+                        # When <= 30 seconds remain, lock the #1 song in the queue and pre-download it immediately
+                        if remaining_sec <= 30.0 and _next_locked_track is None:
+                            q_snapshot = _get_radio_queue_docs()
+                            if q_snapshot:
+                                for it in q_snapshot:
+                                    it["score"] = _calculate_decayed_score(it, time.time())
+                                q_snapshot.sort(key=lambda x: (x["score"], -x.get("added_at", 0)), reverse=True)
+                                _next_locked_track = q_snapshot[0]
+                                logger.info(f"[HLS STREAMER] 🔒 30s remaining. Locked next track: '{_next_locked_track.get('title')}' ({_next_locked_track.get('videoId')}). Pre-downloading now...")
+                                asyncio.create_task(asyncio.to_thread(_download_radio_audio_track, _next_locked_track["videoId"]))
 
                         # Drift-free pacing
                         next_chunk_time += len(pcm_data) / BYTES_PER_SEC
