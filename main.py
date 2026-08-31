@@ -19,6 +19,7 @@ import time
 import re
 import random
 import asyncio
+import threading
 import hmac
 import hashlib
 import base64
@@ -231,8 +232,8 @@ async def lifespan(app: FastAPI):
         f"🚀 {len(endpoints)} API Gateway endpoint(s) live in {GATEWAY_REGIONS}: {endpoints}"
     )
 
-    # Start HLS Live Radio background worker
-    asyncio.create_task(_hls_radio_worker_loop())
+    # Start HLS Live Radio dedicated background worker thread
+    _start_hls_streamer_thread()
 
     yield
 
@@ -2767,7 +2768,7 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
         logger.error(f"[HLS STREAMER] Exception downloading track {video_id}: {e}")
     return None
 
-async def _launch_persistent_ffmpeg():
+def _launch_persistent_ffmpeg():
     """Starts the single persistent FFmpeg HLS encoding process reading PCM from pipe:0."""
     global _ffmpeg_hls_proc
     _ensure_hls_dirs()
@@ -2811,20 +2812,18 @@ async def _launch_persistent_ffmpeg():
         logger.warning(f"[HLS STREAMER] FFmpeg launch notice: {e} (Ensure FFmpeg is installed in container)")
         return None
 
-async def _hls_radio_worker_loop():
-    """Continuous background worker feeding raw PCM chunks into persistent FFmpeg with drift-free wall-clock pacing and 30s pre-download locking."""
+def _hls_radio_worker_thread():
+    """Continuous dedicated background daemon thread feeding raw PCM chunks into persistent FFmpeg."""
     global _ffmpeg_hls_proc, _hls_current_track, _next_locked_track
     _ensure_hls_dirs()
-    await asyncio.sleep(2)
+    time.sleep(2)
 
-    ffmpeg_proc = await _launch_persistent_ffmpeg()
+    ffmpeg_proc = _launch_persistent_ffmpeg()
     if not ffmpeg_proc or not ffmpeg_proc.stdin:
-        logger.warning("[HLS STREAMER] FFmpeg not available. HLS streamer worker will retry on need.")
+        logger.warning("[HLS STREAMER] FFmpeg not available. HLS streamer worker dormant.")
         return
 
-    # Start periodic cache cleaner
-    asyncio.create_task(_periodic_cache_cleaner_task())
-    logger.info("[HLS STREAMER] Live HLS Radio background worker active.")
+    logger.info("[HLS STREAMER] Live HLS Radio background worker thread active.")
 
     while True:
         try:
@@ -2844,7 +2843,7 @@ async def _hls_radio_worker_loop():
             if chosen_track:
                 vid = chosen_track["videoId"]
 
-                audio_file = await asyncio.to_thread(_download_radio_audio_track, vid)
+                audio_file = _download_radio_audio_track(vid)
                 if audio_file and audio_file.exists():
                     now_ms = int(time.time() * 1000)
                     _hls_current_track = chosen_track
@@ -2889,7 +2888,7 @@ async def _hls_radio_worker_loop():
                             ffmpeg_proc.stdin.write(pcm_data)
                             ffmpeg_proc.stdin.flush()
                         except (BrokenPipeError, OSError):
-                            ffmpeg_proc = await _launch_persistent_ffmpeg()
+                            ffmpeg_proc = _launch_persistent_ffmpeg()
                             break
 
                         streamed_bytes += len(pcm_data)
@@ -2905,13 +2904,13 @@ async def _hls_radio_worker_loop():
                                 q_snapshot.sort(key=lambda x: (x["score"], -x.get("added_at", 0)), reverse=True)
                                 _next_locked_track = q_snapshot[0]
                                 logger.info(f"[HLS STREAMER] 🔒 30s remaining. Locked next track: '{_next_locked_track.get('title')}' ({_next_locked_track.get('videoId')}). Pre-downloading now...")
-                                asyncio.create_task(asyncio.to_thread(_download_radio_audio_track, _next_locked_track["videoId"]))
+                                threading.Thread(target=_download_radio_audio_track, args=(_next_locked_track["videoId"],), daemon=True).start()
 
                         # Drift-free pacing
                         next_chunk_time += len(pcm_data) / BYTES_PER_SEC
                         sleep_duration = max(0.0, next_chunk_time - time.monotonic())
                         if sleep_duration > 0:
-                            await asyncio.sleep(sleep_duration)
+                            time.sleep(sleep_duration)
 
                     decoder_proc.wait()
                     logger.info(f"[HLS STREAMER] Finished track: '{chosen_track.get('title')}'.")
@@ -2923,7 +2922,7 @@ async def _hls_radio_worker_loop():
                         pass
                 else:
                     _remove_radio_queue_doc(chosen_track["queue_id"])
-                    await asyncio.sleep(1)
+                    time.sleep(1)
             else:
                 _hls_current_track = None
                 silent_chunk = b"\x00" * CHUNK_SIZE
@@ -2931,12 +2930,16 @@ async def _hls_radio_worker_loop():
                     ffmpeg_proc.stdin.write(silent_chunk)
                     ffmpeg_proc.stdin.flush()
                 except (BrokenPipeError, OSError):
-                    ffmpeg_proc = await _launch_persistent_ffmpeg()
-                await asyncio.sleep(0.095)
+                    ffmpeg_proc = _launch_persistent_ffmpeg()
+                time.sleep(0.095)
 
         except Exception as e:
-            logger.error(f"[HLS STREAMER] Worker exception: {e}")
-            await asyncio.sleep(1)
+            logger.error(f"[HLS STREAMER] Thread exception: {e}")
+            time.sleep(1)
+
+def _start_hls_streamer_thread():
+    t = threading.Thread(target=_hls_radio_worker_thread, daemon=True, name="HlsRadioStreamerThread")
+    t.start()
 
 # ------------------ HLS STREAM ENDPOINTS ------------------
 
