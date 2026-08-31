@@ -2761,6 +2761,11 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "ios", "web_embedded", "web"]
+                }
+            },
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -2819,9 +2824,18 @@ def _launch_persistent_ffmpeg():
         logger.warning(f"[HLS STREAMER] FFmpeg launch notice: {e} (Ensure FFmpeg is installed in container)")
         return None
 
+DEFAULT_CAMPUS_PLAYLIST = [
+    {"videoId": "lbEtG0ZjyJA", "title": "Aaya Sher (From \"The Paradise\")", "artist": "Anirudh Ravichander", "duration_sec": 287, "duration_text": "4:47", "thumbnail": "https://yt3.googleusercontent.com/nZevbUEupxBKmJ3VR6f4rdlYv5Tr53yVHws35zJg9JId6uuBAHgEeRDmf87DcEQkLCJFSHN31BLjYJE=w120-h120-l90-rj", "added_by": "Campus Radio 📻"},
+    {"videoId": "jWJQl-9n3XA", "title": "Sirivennela", "artist": "Anurag Kulkarni", "duration_sec": 254, "duration_text": "4:14", "thumbnail": "https://yt3.googleusercontent.com/wfRTZpb_izYNUKq_U2Xg5SCuZMe91exWiCi84Y6Y2uaN9IXH8A8LtlPZeiyddbCNrUktaYL1Kh0qMwD-=w120-h120-l90-rj", "added_by": "Campus Radio 📻"},
+    {"videoId": "5U5Ru0nTiUM", "title": "Tere Liye", "artist": "Atif Aslam", "duration_sec": 280, "duration_text": "4:40", "thumbnail": "https://yt3.googleusercontent.com/8rcPUY_axCJpmXE7z1tW3ipwgiVVJBmkH05BZTbzUkQ1zYooRjIb2Zfoqj9_hdQPIp0wuV3NJmMbLVA=w120-h120-l90-rj", "added_by": "Campus Radio 📻"},
+    {"videoId": "vL14wk2cj6U", "title": "Ik Vaari Aa (From \"Raabta\")", "artist": "Arijit Singh", "duration_sec": 275, "duration_text": "4:35", "thumbnail": "https://yt3.googleusercontent.com/dnMA___8pamFIWq2DbTLFGkgeChz0phQBf-5TRverJ1ud7S1D3DdSphnd10iAnzl_kfttN1w4Z9IZQ80=w120-h120-l90-rj", "added_by": "Campus Radio 📻"},
+    {"videoId": "6eW99oNNRvI", "title": "Love Me Like You Do", "artist": "Ellie Goulding", "duration_sec": 253, "duration_text": "4:13", "thumbnail": "https://yt3.googleusercontent.com/3RCDbhJsO0mTsAT7tKq7g3vuV5pzGN6lCLpO-vRTUWrYMxewvkRkkm7HmAOoAuE2nzPZa_ZeJQ7hZcI=w120-h120-l90-rj", "added_by": "Campus Radio 📻"},
+]
+_default_playlist_cursor = 0
+
 def _hls_radio_worker_thread():
     """Continuous dedicated background daemon thread feeding raw PCM chunks into persistent FFmpeg."""
-    global _ffmpeg_hls_proc, _hls_current_track, _next_locked_track
+    global _ffmpeg_hls_proc, _hls_current_track, _next_locked_track, _default_playlist_cursor
     _ensure_hls_dirs()
     time.sleep(2)
 
@@ -2857,6 +2871,13 @@ def _hls_radio_worker_thread():
                         if started_at > 0 and (now_ms - started_at) < duration_ms:
                             chosen_track = curr
                             logger.info(f"[HLS STREAMER] Resuming active track from DB: '{chosen_track.get('title')}'")
+                    
+                    # If still no track, pick next from 24/7 continuous default campus playlist
+                    if chosen_track is None:
+                        chosen_track = dict(DEFAULT_CAMPUS_PLAYLIST[_default_playlist_cursor % len(DEFAULT_CAMPUS_PLAYLIST)])
+                        chosen_track["queue_id"] = f"default_{secrets.token_hex(6)}"
+                        _default_playlist_cursor += 1
+                        logger.info(f"[HLS STREAMER] 📻 Auto-playing from 24/7 campus playlist: '{chosen_track.get('title')}'")
 
             if chosen_track:
                 vid = chosen_track["videoId"]
