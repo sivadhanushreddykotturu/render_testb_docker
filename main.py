@@ -1872,10 +1872,37 @@ def _parse_yt_duration(dur_str: str) -> int:
             return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
     except Exception:
         pass
-    return 0
+# ------------------ Music Content Filtering (Anti-Skit / Anti-Clips) ------------------
+RADIO_NON_MUSIC_PATTERNS = [
+    r"\bskit\b", r"\bcomedy\b", r"\bprank\b", r"\broast\b", r"\bspoof\b",
+    r"\bstandup\b", r"\bstand up\b", r"\bstand-up\b", r"\bjabardasth\b",
+    r"\bextra jabardasth\b", r"\bserial\b", r"\bepisode\b", r"\bep\s*\d+\b",
+    r"\btrailer\b", r"\bteaser\b", r"\binterview\b", r"\bpress meet\b",
+    r"\bpress conference\b", r"\bfull movie\b", r"\bmovie scene\b",
+    r"\bdeleted scene\b", r"\bclimax scene\b", r"\bshort film\b", r"\breview\b",
+    r"\bglimpse\b", r"\bpromo\b", r"\bmaking of\b", r"\bbehind the scenes\b",
+    r"\bbloopers\b", r"\bpodcast\b", r"\bvlog\b", r"\bvlogs\b", r"\breaction\b",
+    r"\bgameplay\b", r"\bgaming\b", r"\bunboxing\b", r"\bnews\b", r"\blive stream\b",
+    r"\btalk show\b", r"\bhighlights\b", r"\bpubg\b", r"\bfree fire\b", r"\bbgmi\b",
+    r"\btutorial\b", r"\bfunny scenes\b", r"\bcomedy scene\b", r"\bfunny video\b"
+]
+
+_NON_MUSIC_RE = re.compile("|".join(RADIO_NON_MUSIC_PATTERNS), re.IGNORECASE)
+
+def _is_allowed_music_track(title: str, artist: str = "") -> bool:
+    """Returns True only if the content is an actual music song/audio/lyrical video."""
+    t_clean = title.strip()
+    a_clean = artist.strip()
+    # Official Topic channels and Vevo are always valid music
+    if a_clean.endswith(" - Topic") or "vevo" in a_clean.lower():
+        return True
+    # Check title and artist against non-music patterns
+    if _NON_MUSIC_RE.search(t_clean) or _NON_MUSIC_RE.search(a_clean):
+        return False
+    return True
 
 async def search_youtube_music_no_key(query: str, limit: int = 15) -> list[dict]:
-    """Scrapes YouTube search results without needing any Google/YouTube API key."""
+    """Scrapes YouTube search results, filtering out skits, comedy, trailers, and podcasts."""
     clean_query = query.strip()
     if not clean_query:
         return []
@@ -1925,8 +1952,8 @@ async def search_youtube_music_no_key(query: str, limit: int = 15) -> list[dict]
                     thumbs = vr.get("thumbnail", {}).get("thumbnails", [])
                     thumb = thumbs[-1].get("url", "") if thumbs else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
 
-                    # Duration filtering: 60s (1 min) to 600s (10 min) bounds per spec
-                    if vid and title and 60 <= dur_sec <= 600:
+                    # Duration filtering (60s to 600s) + strict Music Content Verification (Anti-Skit)
+                    if vid and title and 60 <= dur_sec <= 600 and _is_allowed_music_track(title, channel):
                         videos.append({
                             "videoId": vid,
                             "title": title,
@@ -2294,6 +2321,13 @@ async def radio_add_queue(
     # Sanity checks
     if duration_sec < 60 or duration_sec > 600:
         raise HTTPException(status_code=400, detail="Song duration must be between 1 and 10 minutes.")
+
+    # Strict anti-skit/anti-clip check on title and artist
+    if not _is_allowed_music_track(title, artist):
+        raise HTTPException(
+            status_code=400,
+            detail="Only songs, audio, and music tracks can be queued on Campus Radio. Skits, trailers, and talk shows are blocked."
+        )
 
     # Check cooldown (1 add per 10 minutes per student)
     allowed, remaining = _check_and_update_cooldown(user_id)
