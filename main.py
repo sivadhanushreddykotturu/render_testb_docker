@@ -1809,6 +1809,7 @@ RADIO_MAX_USER_QUEUE = 2      # Max active songs in queue per student
 RADIO_ANTI_REPEAT_SEC = 2700  # 45 minutes anti-repeat window
 
 _radio_advance_lock = asyncio.Lock()
+_radio_wake_event = threading.Event()
 
 # ------------------ Radio In-Memory State & Fallback ------------------
 _mem_radio_state = {
@@ -2386,21 +2387,9 @@ async def _advance_radio_track(force: bool = False) -> dict:
         return new_state
 
 async def _get_current_radio_state(user_id: str = "") -> dict:
-    """Returns the synchronized radio state, automatically advancing if the track finished or is invalid."""
+    """Returns the synchronized radio state driven by the live HLS streamer worker."""
     state = _get_radio_state_doc()
     now_ms = int(time.time() * 1000)
-
-    # Check if currently playing track is non-music or has ended
-    if state.get("status") == "playing" and state.get("track"):
-        track = state["track"]
-        if not _is_allowed_music_track(track.get("title", ""), track.get("artist", "")):
-            logger.info(f"[RADIO] Auto-skipping non-music track: {track.get('title')}")
-            state = await _advance_radio_track(force=True)
-        else:
-            duration_ms = int(track.get("duration_sec", 0)) * 1000
-            started_at = int(state.get("started_at", 0))
-            if now_ms - started_at >= duration_ms:
-                state = await _advance_radio_track(force=False)
 
     # Format queue with score and user vote indicator
     queue = _get_radio_queue_docs()
@@ -2608,10 +2597,9 @@ async def radio_add_queue(
     _add_radio_queue_doc(queue_item)
     logger.info(f"[RADIO] {user_id} queued '{title}' ({videoId})")
 
-    # If radio is idle, start playing immediately!
-    state = _get_radio_state_doc()
-    if state.get("status") != "playing" or not state.get("track"):
-        await _advance_radio_track(force=True)
+    # Wake up streamer worker thread and lock/pre-download next track immediately
+    _radio_wake_event.set()
+    _select_and_lock_next_track()
 
     return await _get_current_radio_state(user_id=user_id)
 
@@ -3031,7 +3019,9 @@ def _hls_radio_worker_thread():
                         audio_file.unlink(missing_ok=True)
                     except Exception:
                         pass
+                    _hls_current_track = None
                 else:
+                    _hls_current_track = None
                     logger.warning(f"[HLS STREAMER] Skipped unplayable track: '{chosen_track.get('title')}'")
                     if chosen_track.get("queue_id"):
                         _remove_radio_queue_doc(chosen_track["queue_id"])
@@ -3053,7 +3043,8 @@ def _hls_radio_worker_thread():
                     ffmpeg_proc.stdin.flush()
                 except (BrokenPipeError, OSError):
                     ffmpeg_proc = _launch_persistent_ffmpeg()
-                time.sleep(0.095)
+                _radio_wake_event.wait(timeout=0.095)
+                _radio_wake_event.clear()
 
         except Exception as e:
             logger.error(f"[HLS STREAMER] Thread exception: {e}")
