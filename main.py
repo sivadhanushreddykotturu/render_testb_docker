@@ -2890,17 +2890,69 @@ def _launch_persistent_ffmpeg():
         return None
 
 DEFAULT_CAMPUS_PLAYLIST = [
+    # --- TELUGU BLOCKBUSTERS ---
     {"videoId": "lbEtG0ZjyJA", "title": "Aaya Sher (From \"The Paradise\")", "artist": "Anirudh Ravichander", "duration_sec": 287, "duration_text": "4:47", "thumbnail": "https://yt3.googleusercontent.com/nZevbUEupxBKmJ3VR6f4rdlYv5Tr53yVHws35zJg9JId6uuBAHgEeRDmf87DcEQkLCJFSHN31BLjYJE=w120-h120-l90-rj", "added_by": "Campus Radio 📻"},
-    {"videoId": "jWJQl-9n3XA", "title": "Sirivennela", "artist": "Anurag Kulkarni", "duration_sec": 254, "duration_text": "4:14", "thumbnail": "https://yt3.googleusercontent.com/wfRTZpb_izYNUKq_U2Xg5SCuZMe91exWiCi84Y6Y2uaN9IXH8A8LtlPZeiyddbCNrUktaYL1Kh0qMwD-=w120-h120-l90-rj", "added_by": "Campus Radio 📻"},
-    {"videoId": "5U5Ru0nTiUM", "title": "Tere Liye", "artist": "Atif Aslam", "duration_sec": 280, "duration_text": "4:40", "thumbnail": "https://yt3.googleusercontent.com/8rcPUY_axCJpmXE7z1tW3ipwgiVVJBmkH05BZTbzUkQ1zYooRjIb2Zfoqj9_hdQPIp0wuV3NJmMbLVA=w120-h120-l90-rj", "added_by": "Campus Radio 📻"},
-    {"videoId": "vL14wk2cj6U", "title": "Ik Vaari Aa (From \"Raabta\")", "artist": "Arijit Singh", "duration_sec": 275, "duration_text": "4:35", "thumbnail": "https://yt3.googleusercontent.com/dnMA___8pamFIWq2DbTLFGkgeChz0phQBf-5TRverJ1ud7S1D3DdSphnd10iAnzl_kfttN1w4Z9IZQ80=w120-h120-l90-rj", "added_by": "Campus Radio 📻"},
+    {"videoId": "jWJQl-9n3XA", "title": "Sirivennela (Shyam Singha Roy)", "artist": "Anurag Kulkarni", "duration_sec": 254, "duration_text": "4:14", "thumbnail": "https://yt3.googleusercontent.com/wfRTZpb_izYNUKq_U2Xg5SCuZMe91exWiCi84Y6Y2uaN9IXH8A8LtlPZeiyddbCNrUktaYL1Kh0qMwD-=w120-h120-l90-rj", "added_by": "Campus Radio 📻"},
+    {"videoId": "3sX_7L4kOaE", "title": "Fear Song (Devara)", "artist": "Anirudh Ravichander", "duration_sec": 195, "duration_text": "3:15", "thumbnail": "https://i.ytimg.com/vi/3sX_7L4kOaE/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "8wA6d_Q2hP0", "title": "Chuttamalle (Devara)", "artist": "Shilpa Rao, Anirudh Ravichander", "duration_sec": 222, "duration_text": "3:42", "thumbnail": "https://i.ytimg.com/vi/8wA6d_Q2hP0/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "GvlG_b5g8c0", "title": "Kurchi Madathapetti (Guntur Kaaram)", "artist": "Thaman S, Mahesh Babu", "duration_sec": 216, "duration_text": "3:36", "thumbnail": "https://i.ytimg.com/vi/GvlG_b5g8c0/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "YvV9w1bLw3I", "title": "Ta Takkara (Kalki 2898 AD)", "artist": "Sanjith Hegde, Dhibu Ninan Thomas", "duration_sec": 220, "duration_text": "3:40", "thumbnail": "https://i.ytimg.com/vi/YvV9w1bLw3I/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "F4z-zBq4Y7w", "title": "Sooseki (Pushpa 2 The Rule)", "artist": "Shreya Ghoshal, Devi Sri Prasad", "duration_sec": 260, "duration_text": "4:20", "thumbnail": "https://i.ytimg.com/vi/F4z-zBq4Y7w/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "1_hP-Jz6C8E", "title": "Pushpa Pushpa (Pushpa 2)", "artist": "Nakash Aziz, Devi Sri Prasad", "duration_sec": 255, "duration_text": "4:15", "thumbnail": "https://i.ytimg.com/vi/1_hP-Jz6C8E/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "OsU0HmuqgVM", "title": "Naatu Naatu (RRR)", "artist": "Rahul Sipligunj, Kaala Bhairava", "duration_sec": 216, "duration_text": "3:36", "thumbnail": "https://i.ytimg.com/vi/OsU0HmuqgVM/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "peLhUjW7-54", "title": "Samajavaragamana (Ala Vaikunthapurramuloo)", "artist": "Sid Sriram, Thaman S", "duration_sec": 223, "duration_text": "3:43", "thumbnail": "https://i.ytimg.com/vi/peLhUjW7-54/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "2mDCVzruYzQ", "title": "Butta Bomma (Ala Vaikunthapurramuloo)", "artist": "Armaan Malik, Thaman S", "duration_sec": 198, "duration_text": "3:18", "thumbnail": "https://i.ytimg.com/vi/2mDCVzruYzQ/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "p_G3u7u2m5s", "title": "Inthandham (Sita Ramam)", "artist": "SPB Charan, Vishal Chandrashekhar", "duration_sec": 225, "duration_text": "3:45", "thumbnail": "https://i.ytimg.com/vi/p_G3u7u2m5s/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+
+    # --- HINDI & BOLLYWOOD HITS ---
+    {"videoId": "5U5Ru0nTiUM", "title": "Tere Liye (Prince)", "artist": "Atif Aslam, Shreya Ghoshal", "duration_sec": 280, "duration_text": "4:40", "thumbnail": "https://yt3.googleusercontent.com/8rcPUY_axCJpmXE7z1tW3ipwgiVVJBmkH05BZTbzUkQ1zYooRjIb2Zfoqj9_hdQPIp0wuV3NJmMbLVA=w120-h120-l90-rj", "added_by": "Campus Radio 📻"},
+    {"videoId": "vL14wk2cj6U", "title": "Ik Vaari Aa (Raabta)", "artist": "Arijit Singh, Pritam", "duration_sec": 275, "duration_text": "4:35", "thumbnail": "https://yt3.googleusercontent.com/dnMA___8pamFIWq2DbTLFGkgeChz0phQBf-5TRverJ1ud7S1D3DdSphnd10iAnzl_kfttN1w4Z9IZQ80=w120-h120-l90-rj", "added_by": "Campus Radio 📻"},
+    {"videoId": "k3g_Wj7474U", "title": "Sajni (Laapataa Ladies)", "artist": "Arijit Singh, Ram Sampath", "duration_sec": 170, "duration_text": "2:50", "thumbnail": "https://i.ytimg.com/vi/k3g_Wj7474U/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "dZ0fwJojhrs", "title": "Pehle Bhi Main (Animal)", "artist": "Vishal Mishra, Harshavardhan Rameshwar", "duration_sec": 250, "duration_text": "4:10", "thumbnail": "https://i.ytimg.com/vi/dZ0fwJojhrs/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "VAdGW7QDJUI", "title": "Chaleya (Jawan)", "artist": "Arijit Singh, Shilpa Rao, Anirudh", "duration_sec": 200, "duration_text": "3:20", "thumbnail": "https://i.ytimg.com/vi/VAdGW7QDJUI/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "BddP6PYo2gs", "title": "Kesariya (Brahmastra)", "artist": "Arijit Singh, Pritam", "duration_sec": 268, "duration_text": "4:28", "thumbnail": "https://i.ytimg.com/vi/BddP6PYo2gs/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "iAIBF2ngbWY", "title": "O Maahi (Dunki)", "artist": "Arijit Singh, Pritam", "duration_sec": 233, "duration_text": "3:53", "thumbnail": "https://i.ytimg.com/vi/iAIBF2ngbWY/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "ElZfdU54Cp8", "title": "Apna Bana Le (Bhediya)", "artist": "Arijit Singh, Sachin-Jigar", "duration_sec": 261, "duration_text": "4:21", "thumbnail": "https://i.ytimg.com/vi/ElZfdU54Cp8/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "q6U_y6WzHOU", "title": "Tum Se (TBMAUJ)", "artist": "Sachin-Jigar, Raghav Chaitanya", "duration_sec": 264, "duration_text": "4:24", "thumbnail": "https://i.ytimg.com/vi/q6U_y6WzHOU/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "gvyUuxdRdR4", "title": "Raataan Lambiyan (Shershaah)", "artist": "Jubin Nautiyal, Asees Kaur", "duration_sec": 230, "duration_text": "3:50", "thumbnail": "https://i.ytimg.com/vi/gvyUuxdRdR4/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "ILRs2r6lcHY", "title": "Shayad (Love Aaj Kal)", "artist": "Arijit Singh, Pritam", "duration_sec": 247, "duration_text": "4:07", "thumbnail": "https://i.ytimg.com/vi/ILRs2r6lcHY/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "x_bK_5u6qEE", "title": "Ve Kamleya (Rocky Aur Rani)", "artist": "Arijit Singh, Shreya Ghoshal", "duration_sec": 246, "duration_text": "4:06", "thumbnail": "https://i.ytimg.com/vi/x_bK_5u6qEE/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+
+    # --- ENGLISH & GLOBAL POP HITS ---
     {"videoId": "6eW99oNNRvI", "title": "Love Me Like You Do", "artist": "Ellie Goulding", "duration_sec": 253, "duration_text": "4:13", "thumbnail": "https://yt3.googleusercontent.com/3RCDbhJsO0mTsAT7tKq7g3vuV5pzGN6lCLpO-vRTUWrYMxewvkRkkm7HmAOoAuE2nzPZa_ZeJQ7hZcI=w120-h120-l90-rj", "added_by": "Campus Radio 📻"},
+    {"videoId": "34Na4j8AVgA", "title": "Starboy", "artist": "The Weeknd ft. Daft Punk", "duration_sec": 230, "duration_text": "3:50", "thumbnail": "https://i.ytimg.com/vi/34Na4j8AVgA/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "4NRXx6U8ABQ", "title": "Blinding Lights", "artist": "The Weeknd", "duration_sec": 200, "duration_text": "3:20", "thumbnail": "https://i.ytimg.com/vi/4NRXx6U8ABQ/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "JGwWNGJdvx8", "title": "Shape of You", "artist": "Ed Sheeran", "duration_sec": 233, "duration_text": "3:53", "thumbnail": "https://i.ytimg.com/vi/JGwWNGJdvx8/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "7wtfhZwyrcc", "title": "Believer", "artist": "Imagine Dragons", "duration_sec": 204, "duration_text": "3:24", "thumbnail": "https://i.ytimg.com/vi/7wtfhZwyrcc/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "H5v3k2nnD5Y", "title": "As It Was", "artist": "Harry Styles", "duration_sec": 167, "duration_text": "2:47", "thumbnail": "https://i.ytimg.com/vi/H5v3k2nnD5Y/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "syFZfO_wfMQ", "title": "Night Changes", "artist": "One Direction", "duration_sec": 226, "duration_text": "3:46", "thumbnail": "https://i.ytimg.com/vi/syFZfO_wfMQ/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "kTJczUoc56U", "title": "Stay", "artist": "The Kid LAROI, Justin Bieber", "duration_sec": 141, "duration_text": "2:21", "thumbnail": "https://i.ytimg.com/vi/kTJczUoc56U/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "W8a4sUabCUo", "title": "Dandelions", "artist": "Ruth B.", "duration_sec": 233, "duration_text": "3:53", "thumbnail": "https://i.ytimg.com/vi/W8a4sUabCUo/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "SlPhMPnQ58k", "title": "Memories", "artist": "Maroon 5", "duration_sec": 189, "duration_text": "3:09", "thumbnail": "https://i.ytimg.com/vi/SlPhMPnQ58k/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "2Vv-BfVoq4g", "title": "Perfect", "artist": "Ed Sheeran", "duration_sec": 263, "duration_text": "4:23", "thumbnail": "https://i.ytimg.com/vi/2Vv-BfVoq4g/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "hT_nvWreIhg", "title": "Counting Stars", "artist": "OneRepublic", "duration_sec": 257, "duration_text": "4:17", "thumbnail": "https://i.ytimg.com/vi/hT_nvWreIhg/hqdefault.jpg", "added_by": "Campus Radio 📻"},
 ]
-_default_playlist_cursor = 0
+
+_recent_fallback_vids: list[str] = []
+
+def _pick_next_fallback_track() -> dict:
+    """Selects a fresh track from the curated playlist using anti-repeat shuffle."""
+    global _recent_fallback_vids
+    candidates = [t for t in DEFAULT_CAMPUS_PLAYLIST if t.get("videoId") not in _recent_fallback_vids]
+    if not candidates:
+        _recent_fallback_vids.clear()
+        candidates = list(DEFAULT_CAMPUS_PLAYLIST)
+
+    selected = dict(random.choice(candidates))
+    selected["queue_id"] = f"default_{secrets.token_hex(6)}"
+    _recent_fallback_vids.append(selected.get("videoId"))
+    if len(_recent_fallback_vids) > 15:
+        _recent_fallback_vids.pop(0)
+    return selected
 
 def _select_and_lock_next_track():
     """Immediately selects and locks the second song ahead of time, ensuring ratings/votes won't affect it once locked, and pre-downloads it immediately."""
-    global _next_locked_track, _default_playlist_cursor
+    global _next_locked_track
     if _next_locked_track is not None:
         return _next_locked_track
 
@@ -2913,9 +2965,7 @@ def _select_and_lock_next_track():
         _next_locked_track = queue[0]
         logger.info(f"[HLS STREAMER] 🔒 Automatically selected & locked next track from queue: '{_next_locked_track.get('title')}' ({_next_locked_track.get('videoId')}). Pre-downloading now...")
     else:
-        candidate = dict(DEFAULT_CAMPUS_PLAYLIST[_default_playlist_cursor % len(DEFAULT_CAMPUS_PLAYLIST)])
-        candidate["queue_id"] = f"default_{secrets.token_hex(6)}"
-        _default_playlist_cursor += 1
+        candidate = _pick_next_fallback_track()
         _next_locked_track = candidate
         logger.info(f"[HLS STREAMER] 🔒 Automatically selected & locked next track from 24/7 campus playlist: '{_next_locked_track.get('title')}'. Pre-downloading now...")
 
@@ -2926,7 +2976,7 @@ def _select_and_lock_next_track():
 
 def _hls_radio_worker_thread():
     """Continuous dedicated background daemon thread feeding raw PCM chunks into persistent FFmpeg."""
-    global _ffmpeg_hls_proc, _hls_current_track, _next_locked_track, _default_playlist_cursor
+    global _ffmpeg_hls_proc, _hls_current_track, _next_locked_track
     _ensure_hls_dirs()
     time.sleep(2)
 
@@ -2965,9 +3015,7 @@ def _hls_radio_worker_thread():
 
                     # If still no track, pick next from 24/7 continuous default campus playlist
                     if chosen_track is None:
-                        chosen_track = dict(DEFAULT_CAMPUS_PLAYLIST[_default_playlist_cursor % len(DEFAULT_CAMPUS_PLAYLIST)])
-                        chosen_track["queue_id"] = f"default_{secrets.token_hex(6)}"
-                        _default_playlist_cursor += 1
+                        chosen_track = _pick_next_fallback_track()
                         logger.info(f"[HLS STREAMER] 📻 Auto-playing from 24/7 campus playlist: '{chosen_track.get('title')}'")
 
             if chosen_track:
