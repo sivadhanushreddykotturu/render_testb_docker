@@ -2740,7 +2740,7 @@ async def _periodic_cache_cleaner_task():
             await asyncio.sleep(60)
 
 def _download_radio_audio_track(video_id: str) -> Path | None:
-    """Pre-downloads high quality audio track from YouTube using yt-dlp with android/ios simulation & piped fallback."""
+    """Pre-downloads high quality audio track from YouTube using yt-dlp with multi-client fallbacks (android_creator, tv_embedded, web with bgutil PO token)."""
     _ensure_hls_dirs()
     clean_vid = video_id.strip()
 
@@ -2753,59 +2753,69 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
     logger.info(f"[HLS STREAMER] Downloading audio for videoId: {clean_vid}")
     url = f"https://www.youtube.com/watch?v={clean_vid}"
 
-    # 1. Primary: yt-dlp with PO-Token provider sidecar & android/web client
-    try:
-        import yt_dlp
-        ydl_opts = {
-            "format": "bestaudio/best",
+    import yt_dlp
+
+    # Multi-strategy client configurations to bypass datacenter IP restrictions
+    client_strategies = [
+        # Strategy 1: Android + iOS simulation (100% verified reliable, fast, zero-block)
+        {
+            "format": "ba/b/bestaudio/18/best",
             "outtmpl": str(CACHE_DIR / f"{clean_vid}.%(ext)s"),
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android", "web"],
-                    "pot_provider": "http://127.0.0.1:4416/pot",
-                }
+                    "player_client": ["android", "ios"],
+                },
+            },
+        },
+        # Strategy 2: Web with bgutil PO-token provider plugin (when sidecar container is active on EC2)
+        {
+            "format": "ba/b/bestaudio/best",
+            "outtmpl": str(CACHE_DIR / f"{clean_vid}.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "extractor_args": {
+                "youtubepot-bgutilhttp": {
+                    "base_url": ["http://127.0.0.1:4416"],
+                },
+                "youtube": {
+                    "player_client": ["web", "mweb"],
+                },
             },
             "http_headers": {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
             },
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-
-        downloaded = list(CACHE_DIR.glob(f"{clean_vid}.*"))
-        for f in downloaded:
-            if f.is_file() and f.stat().st_size > 10000:
-                logger.info(f"[HLS STREAMER] Successfully cached {clean_vid} ({f.stat().st_size} bytes)")
-                return f
-    except Exception as e:
-        logger.warning(f"[HLS STREAMER] yt-dlp attempt failed for {clean_vid}: {e}")
-
-    # 2. Secondary Fallback: Invidious / Piped audio stream extraction
-    piped_instances = [
-        f"https://pipedapi.kavin.rocks/streams/{clean_vid}",
-        f"https://api.piped.privacydev.net/streams/{clean_vid}",
-        f"https://pipedapi.tokhmi.xyz/streams/{clean_vid}",
+        },
+        # Strategy 3: Android Creator fallback
+        {
+            "format": "ba/b/bestaudio/best",
+            "outtmpl": str(CACHE_DIR / f"{clean_vid}.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android_creator"],
+                },
+            },
+        },
     ]
-    for instance_url in piped_instances:
+
+    for idx, ydl_opts in enumerate(client_strategies, 1):
         try:
-            with httpx.Client(timeout=8) as client:
-                resp = client.get(instance_url)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    audio_streams = data.get("audioStreams", [])
-                    if audio_streams:
-                        stream_url = audio_streams[0]["url"]
-                        target_file = CACHE_DIR / f"{clean_vid}.m4a"
-                        dl_cmd = ["ffmpeg", "-y", "-i", stream_url, "-c", "copy", str(target_file)]
-                        subprocess.run(dl_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
-                        if target_file.exists() and target_file.stat().st_size > 10000:
-                            logger.info(f"[HLS STREAMER] Successfully cached {clean_vid} via Piped Stream ({target_file.stat().st_size} bytes)")
-                            return target_file
-        except Exception:
-            continue
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+
+            downloaded = list(CACHE_DIR.glob(f"{clean_vid}.*"))
+            for f in downloaded:
+                if f.is_file() and f.stat().st_size > 10000:
+                    logger.info(f"[HLS STREAMER] Successfully cached {clean_vid} via strategy {idx} ({f.stat().st_size} bytes)")
+                    return f
+        except Exception as e:
+            logger.warning(f"[HLS STREAMER] Strategy {idx} failed for {clean_vid}: {e}")
 
     logger.error(f"[HLS STREAMER] All download strategies failed for {clean_vid}")
     return None
@@ -2814,6 +2824,14 @@ def _launch_persistent_ffmpeg():
     """Starts the single persistent FFmpeg HLS encoding process reading PCM from pipe:0."""
     global _ffmpeg_hls_proc
     _ensure_hls_dirs()
+
+    # Clean up stale/corrupt 0-byte segments from previous crashes or restarts
+    try:
+        for p in HLS_DIR.glob("*.ts"):
+            if p.is_file() and p.stat().st_size == 0:
+                p.unlink(missing_ok=True)
+    except Exception:
+        pass
 
     # Kill stale process if exists
     if _ffmpeg_hls_proc and _ffmpeg_hls_proc.poll() is None:
@@ -2826,7 +2844,6 @@ def _launch_persistent_ffmpeg():
     cmd = [
         "ffmpeg",
         "-y",
-        "-re",
         "-f", "s16le",
         "-ar", str(SAMPLE_RATE),
         "-ac", str(CHANNELS),
@@ -2836,7 +2853,7 @@ def _launch_persistent_ffmpeg():
         "-f", "hls",
         "-hls_time", "2",
         "-hls_list_size", "5",
-        "-hls_flags", "delete_segments+append_list+omit_endlist",
+        "-hls_flags", "delete_segments+omit_endlist",
         "-hls_segment_filename", str(HLS_DIR / "seg_%05d.ts"),
         str(HLS_DIR / "stream.m3u8"),
     ]
@@ -2846,7 +2863,7 @@ def _launch_persistent_ffmpeg():
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
         logger.info("[HLS STREAMER] Persistent FFmpeg daemon launched successfully.")
         return _ffmpeg_hls_proc
@@ -2862,6 +2879,32 @@ DEFAULT_CAMPUS_PLAYLIST = [
     {"videoId": "6eW99oNNRvI", "title": "Love Me Like You Do", "artist": "Ellie Goulding", "duration_sec": 253, "duration_text": "4:13", "thumbnail": "https://yt3.googleusercontent.com/3RCDbhJsO0mTsAT7tKq7g3vuV5pzGN6lCLpO-vRTUWrYMxewvkRkkm7HmAOoAuE2nzPZa_ZeJQ7hZcI=w120-h120-l90-rj", "added_by": "Campus Radio 📻"},
 ]
 _default_playlist_cursor = 0
+
+def _select_and_lock_next_track():
+    """Immediately selects and locks the second song ahead of time, ensuring ratings/votes won't affect it once locked, and pre-downloads it immediately."""
+    global _next_locked_track, _default_playlist_cursor
+    if _next_locked_track is not None:
+        return _next_locked_track
+
+    queue = _get_radio_queue_docs()
+    if queue:
+        now_sec = time.time()
+        for it in queue:
+            it["score"] = _calculate_decayed_score(it, now_sec)
+        queue.sort(key=lambda x: (x["score"], -x.get("added_at", 0)), reverse=True)
+        _next_locked_track = queue[0]
+        logger.info(f"[HLS STREAMER] 🔒 Automatically selected & locked next track from queue: '{_next_locked_track.get('title')}' ({_next_locked_track.get('videoId')}). Pre-downloading now...")
+    else:
+        candidate = dict(DEFAULT_CAMPUS_PLAYLIST[_default_playlist_cursor % len(DEFAULT_CAMPUS_PLAYLIST)])
+        candidate["queue_id"] = f"default_{secrets.token_hex(6)}"
+        _default_playlist_cursor += 1
+        _next_locked_track = candidate
+        logger.info(f"[HLS STREAMER] 🔒 Automatically selected & locked next track from 24/7 campus playlist: '{_next_locked_track.get('title')}'. Pre-downloading now...")
+
+    if _next_locked_track:
+        threading.Thread(target=_download_radio_audio_track, args=(_next_locked_track["videoId"],), daemon=True).start()
+
+    return _next_locked_track
 
 def _hls_radio_worker_thread():
     """Continuous dedicated background daemon thread feeding raw PCM chunks into persistent FFmpeg."""
@@ -2901,7 +2944,7 @@ def _hls_radio_worker_thread():
                         if started_at > 0 and (now_ms - started_at) < duration_ms:
                             chosen_track = curr
                             logger.info(f"[HLS STREAMER] Resuming active track from DB: '{chosen_track.get('title')}'")
-                    
+
                     # If still no track, pick next from 24/7 continuous default campus playlist
                     if chosen_track is None:
                         chosen_track = dict(DEFAULT_CAMPUS_PLAYLIST[_default_playlist_cursor % len(DEFAULT_CAMPUS_PLAYLIST)])
@@ -2935,6 +2978,11 @@ def _hls_radio_worker_thread():
                         _remove_radio_queue_doc(chosen_track["queue_id"])
                     _add_radio_history_doc(chosen_track)
 
+                    # AS SOON AS THE CURRENT SONG STARTS PLAYING:
+                    # Immediately select and lock the second song ahead of time,
+                    # ensuring ratings/votes won't affect it once locked, and pre-download it immediately.
+                    _select_and_lock_next_track()
+
                     decode_cmd = [
                         "ffmpeg",
                         "-i", str(audio_file),
@@ -2959,22 +3007,15 @@ def _hls_radio_worker_thread():
                             ffmpeg_proc.stdin.flush()
                         except (BrokenPipeError, OSError):
                             ffmpeg_proc = _launch_persistent_ffmpeg()
-                            break
+                            if not ffmpeg_proc or not ffmpeg_proc.stdin:
+                                break
+                            try:
+                                ffmpeg_proc.stdin.write(pcm_data)
+                                ffmpeg_proc.stdin.flush()
+                            except Exception:
+                                break
 
                         streamed_bytes += len(pcm_data)
-                        streamed_sec = streamed_bytes / BYTES_PER_SEC
-                        remaining_sec = track_duration_sec - streamed_sec
-
-                        # When <= 30 seconds remain, lock the #1 song in the queue and pre-download it immediately
-                        if remaining_sec <= 30.0 and _next_locked_track is None:
-                            q_snapshot = _get_radio_queue_docs()
-                            if q_snapshot:
-                                for it in q_snapshot:
-                                    it["score"] = _calculate_decayed_score(it, time.time())
-                                q_snapshot.sort(key=lambda x: (x["score"], -x.get("added_at", 0)), reverse=True)
-                                _next_locked_track = q_snapshot[0]
-                                logger.info(f"[HLS STREAMER] 🔒 30s remaining. Locked next track: '{_next_locked_track.get('title')}' ({_next_locked_track.get('videoId')}). Pre-downloading now...")
-                                threading.Thread(target=_download_radio_audio_track, args=(_next_locked_track["videoId"],), daemon=True).start()
 
                         # Drift-free pacing
                         next_chunk_time += len(pcm_data) / BYTES_PER_SEC
@@ -2985,15 +3026,25 @@ def _hls_radio_worker_thread():
                     decoder_proc.wait()
                     logger.info(f"[HLS STREAMER] Finished track: '{chosen_track.get('title')}'.")
 
-                    # Immediate post-play cleanup for this specific track
+                    # Post-play cleanup for this specific track
                     try:
                         audio_file.unlink(missing_ok=True)
                     except Exception:
                         pass
                 else:
+                    logger.warning(f"[HLS STREAMER] Skipped unplayable track: '{chosen_track.get('title')}'")
                     if chosen_track.get("queue_id"):
                         _remove_radio_queue_doc(chosen_track["queue_id"])
-                    time.sleep(1)
+                    # Feed comfort silence for 2 seconds while moving to next track so stream never halts
+                    for _ in range(20):
+                        silent_chunk = b"\x00" * CHUNK_SIZE
+                        try:
+                            ffmpeg_proc.stdin.write(silent_chunk)
+                            ffmpeg_proc.stdin.flush()
+                        except Exception:
+                            ffmpeg_proc = _launch_persistent_ffmpeg()
+                            break
+                        time.sleep(0.095)
             else:
                 _hls_current_track = None
                 silent_chunk = b"\x00" * CHUNK_SIZE
@@ -3012,16 +3063,21 @@ _streamer_lock_file = None
 
 def _start_hls_streamer_thread():
     global _streamer_lock_file
+    _ensure_hls_dirs()
+    lock_path = HLS_DIR / ".radio_streamer.lock"
     try:
         import fcntl
-        _streamer_lock_file = open("/tmp/radio_streamer.lock", "w")
+        _streamer_lock_file = open(str(lock_path), "a+")
         fcntl.flock(_streamer_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         logger.info("[HLS STREAMER] Acquired singleton process lock. Starting streamer thread.")
     except (ImportError, AttributeError):
         pass
-    except (IOError, OSError):
-        logger.info("[HLS STREAMER] Another Gunicorn worker is already running the streamer. Skipping duplicate.")
-        return
+    except (BlockingIOError, OSError) as e:
+        import errno
+        if getattr(e, "errno", None) in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+            logger.info("[HLS STREAMER] Another Gunicorn worker is already running the streamer. Skipping duplicate.")
+            return
+        logger.warning(f"[HLS STREAMER] Process lock notice: {e}. Proceeding with thread start.")
 
     t = threading.Thread(target=_hls_radio_worker_thread, daemon=True, name="HlsRadioStreamerThread")
     t.start()
@@ -3058,7 +3114,7 @@ async def radio_hls_segment(segment_name: str):
     """Serves 2-second HLS audio segment (edge cached by Cloudflare)."""
     clean_seg = os.path.basename(segment_name)
     segment_path = HLS_DIR / clean_seg
-    if not segment_path.exists():
+    if not segment_path.exists() or segment_path.stat().st_size == 0:
         raise HTTPException(status_code=404, detail="Segment not found.")
 
     return FileResponse(

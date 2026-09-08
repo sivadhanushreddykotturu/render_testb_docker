@@ -22,8 +22,9 @@ COPY model/ ./model/
 # Run as non-root; pre-create the log dir owned by appuser (only effective
 # when no host bind mount shadows it)
 RUN useradd --create-home appuser \
-    && mkdir -p /app/logs \
-    && chown -R appuser:appuser /app
+    && mkdir -p /app/logs /tmp/hls_radio /tmp/radio_cache \
+    && chown -R appuser:appuser /app /tmp/hls_radio /tmp/radio_cache \
+    && chmod 777 /tmp/hls_radio /tmp/radio_cache
 USER appuser
 
 EXPOSE 8000
