@@ -2501,6 +2501,24 @@ async def radio_state(request: Request):
             pass
     return await _get_current_radio_state(user_id=user_id)
 
+@app.get("/api/radio/diag/download/{video_id}")
+async def radio_diag_download(video_id: str):
+    """Diagnostic endpoint to test YouTube audio download on this server instance."""
+    clean_vid = video_id.strip()
+    result = await asyncio.to_thread(_download_radio_audio_track, clean_vid)
+    if result and result.exists():
+        return {
+            "status": "success",
+            "video_id": clean_vid,
+            "file": str(result),
+            "size_bytes": result.stat().st_size
+        }
+    return {
+        "status": "failed",
+        "video_id": clean_vid,
+        "error": "Download failed across all strategies."
+    }
+
 @app.post("/api/radio/queue")
 @app.post("/radio/queue")
 async def radio_add_queue(
@@ -2697,6 +2715,8 @@ CHUNK_SIZE = 17640  # 100ms PCM chunks (44100 * 2 * 2 * 0.1)
 _ffmpeg_hls_proc: subprocess.Popen | None = None
 _hls_current_track: dict | None = None
 _next_locked_track: dict | None = None
+_download_mutex = threading.Lock()
+_active_downloads: dict[str, threading.Event] = {}
 
 def _ensure_hls_dirs():
     HLS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2728,7 +2748,7 @@ async def _periodic_cache_cleaner_task():
             await asyncio.sleep(60)
 
 def _download_radio_audio_track(video_id: str) -> Path | None:
-    """Pre-downloads high quality audio track from YouTube using yt-dlp with multi-client fallbacks (android_creator, tv_embedded, web with bgutil PO token)."""
+    """Pre-downloads high quality audio track from YouTube using Cloudflare WARP proxy or direct fallbacks."""
     _ensure_hls_dirs()
     clean_vid = video_id.strip()
 
@@ -2738,75 +2758,85 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
         if f.is_file() and f.stat().st_size > 10000:
             return f
 
-    logger.info(f"[HLS STREAMER] Downloading audio for videoId: {clean_vid}")
-    url = f"https://www.youtube.com/watch?v={clean_vid}"
+    # Concurrency guard: avoid two threads downloading the same file simultaneously
+    with _download_mutex:
+        if clean_vid in _active_downloads:
+            event = _active_downloads[clean_vid]
+            is_initiator = False
+        else:
+            event = threading.Event()
+            _active_downloads[clean_vid] = event
+            is_initiator = True
 
-    import yt_dlp
+    if not is_initiator:
+        event.wait(timeout=60)
+        existing = list(CACHE_DIR.glob(f"{clean_vid}.*"))
+        for f in existing:
+            if f.is_file() and f.stat().st_size > 10000:
+                return f
+        return None
 
-    # Multi-strategy client configurations to bypass datacenter IP restrictions
-    client_strategies = [
-        # Strategy 1: Android + iOS simulation (100% verified reliable, fast, zero-block)
-        {
-            "format": "ba/b/bestaudio/18/best",
-            "outtmpl": str(CACHE_DIR / f"{clean_vid}.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android", "ios"],
+    try:
+        logger.info(f"[HLS STREAMER] Downloading audio for videoId: {clean_vid}")
+        url = f"https://www.youtube.com/watch?v={clean_vid}"
+
+        import yt_dlp
+
+        # SOCKS5 proxy (Cloudflare WARP proxy on EC2 port 40001 or custom env)
+        warp_proxy = os.environ.get("RADIO_PROXY_URL", "socks5://127.0.0.1:40001")
+
+        client_strategies = [
+            # Strategy 1: Cloudflare WARP SOCKS5 proxy (bypasses datacenter bot blocks)
+            {
+                "proxy": warp_proxy,
+                "format": "ba/b/bestaudio/best",
+                "outtmpl": str(CACHE_DIR / f"{clean_vid}.%(ext)s"),
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+            },
+            # Strategy 2: Direct connection with android/ios client simulation (works locally / residential)
+            {
+                "format": "ba/b/bestaudio/18/best",
+                "outtmpl": str(CACHE_DIR / f"{clean_vid}.%(ext)s"),
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["android", "ios"],
+                    },
                 },
             },
-        },
-        # Strategy 2: Web with bgutil PO-token provider plugin (when sidecar container is active on EC2)
-        {
-            "format": "ba/b/bestaudio/best",
-            "outtmpl": str(CACHE_DIR / f"{clean_vid}.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "extractor_args": {
-                "youtubepot-bgutilhttp": {
-                    "base_url": ["http://127.0.0.1:4416"],
-                },
-                "youtube": {
-                    "player_client": ["web", "mweb"],
-                },
+            # Strategy 3: Standard direct fallback without proxy
+            {
+                "format": "ba/b/bestaudio/best",
+                "outtmpl": str(CACHE_DIR / f"{clean_vid}.%(ext)s"),
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
             },
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-            },
-        },
-        # Strategy 3: Android Creator fallback
-        {
-            "format": "ba/b/bestaudio/best",
-            "outtmpl": str(CACHE_DIR / f"{clean_vid}.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android_creator"],
-                },
-            },
-        },
-    ]
+        ]
 
-    for idx, ydl_opts in enumerate(client_strategies, 1):
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+        for idx, ydl_opts in enumerate(client_strategies, 1):
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
 
-            downloaded = list(CACHE_DIR.glob(f"{clean_vid}.*"))
-            for f in downloaded:
-                if f.is_file() and f.stat().st_size > 10000:
-                    logger.info(f"[HLS STREAMER] Successfully cached {clean_vid} via strategy {idx} ({f.stat().st_size} bytes)")
-                    return f
-        except Exception as e:
-            logger.warning(f"[HLS STREAMER] Strategy {idx} failed for {clean_vid}: {e}")
+                downloaded = list(CACHE_DIR.glob(f"{clean_vid}.*"))
+                for f in downloaded:
+                    if f.is_file() and f.stat().st_size > 10000:
+                        logger.info(f"[HLS STREAMER] Successfully cached {clean_vid} via strategy {idx} ({f.stat().st_size} bytes)")
+                        return f
+            except Exception as e:
+                logger.warning(f"[HLS STREAMER] Strategy {idx} failed for {clean_vid}: {e}")
 
-    logger.error(f"[HLS STREAMER] All download strategies failed for {clean_vid}")
-    return None
+        logger.error(f"[HLS STREAMER] All download strategies failed for {clean_vid}")
+        return None
+    finally:
+        with _download_mutex:
+            _active_downloads.pop(clean_vid, None)
+        event.set()
 
 def _launch_persistent_ffmpeg():
     """Starts the single persistent FFmpeg HLS encoding process reading PCM from pipe:0."""
@@ -3022,9 +3052,13 @@ def _hls_radio_worker_thread():
                     _hls_current_track = None
                 else:
                     _hls_current_track = None
-                    logger.warning(f"[HLS STREAMER] Skipped unplayable track: '{chosen_track.get('title')}'")
+                    logger.warning(f"[HLS STREAMER] Download not ready or failed for: '{chosen_track.get('title')}'")
                     if chosen_track.get("queue_id"):
-                        _remove_radio_queue_doc(chosen_track["queue_id"])
+                        fail_count = chosen_track.get("fail_count", 0) + 1
+                        chosen_track["fail_count"] = fail_count
+                        if fail_count >= 2:
+                            _remove_radio_queue_doc(chosen_track["queue_id"])
+                            logger.info(f"[HLS STREAMER] Removed failed track from queue after retries: '{chosen_track.get('title')}'")
                     # Feed comfort silence for 2 seconds while moving to next track so stream never halts
                     for _ in range(20):
                         silent_chunk = b"\x00" * CHUNK_SIZE
