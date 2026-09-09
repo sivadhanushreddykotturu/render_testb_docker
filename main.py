@@ -2767,7 +2767,7 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
     # Check if already cached in any audio format
     existing = list(CACHE_DIR.glob(f"{clean_vid}.*"))
     for f in existing:
-        if f.is_file() and f.stat().st_size > 10000:
+        if f.is_file() and not f.name.endswith(".part") and not f.name.endswith(".ytdl") and f.stat().st_size > 500000:
             return f
 
     # Concurrency guard: avoid two threads downloading the same file simultaneously
@@ -2784,7 +2784,7 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
         event.wait(timeout=60)
         existing = list(CACHE_DIR.glob(f"{clean_vid}.*"))
         for f in existing:
-            if f.is_file() and f.stat().st_size > 10000:
+            if f.is_file() and not f.name.endswith(".part") and not f.name.endswith(".ytdl") and f.stat().st_size > 500000:
                 return f
         return None
 
@@ -2837,7 +2837,7 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
 
                 downloaded = list(CACHE_DIR.glob(f"{clean_vid}.*"))
                 for f in downloaded:
-                    if f.is_file() and f.stat().st_size > 10000:
+                    if f.is_file() and not f.name.endswith(".part") and not f.name.endswith(".ytdl") and f.stat().st_size > 500000:
                         logger.info(f"[HLS STREAMER] Successfully cached {clean_vid} via strategy {idx} ({f.stat().st_size} bytes)")
                         return f
             except Exception as e:
@@ -3041,7 +3041,7 @@ def _hls_radio_worker_thread():
                 # Ensure track audio file is downloaded to cache
                 audio_file = None
                 existing = list(CACHE_DIR.glob(f"{vid.strip()}.*"))
-                ready = [f for f in existing if f.is_file() and f.stat().st_size > 10000]
+                ready = [f for f in existing if f.is_file() and not f.name.endswith(".part") and not f.name.endswith(".ytdl") and f.stat().st_size > 500000]
                 if ready:
                     audio_file = ready[0]
                 else:
@@ -3205,7 +3205,7 @@ async def radio_audio_stream(video_id: str, request: Request):
 
     _ensure_hls_dirs()
     existing = list(CACHE_DIR.glob(f"{clean_vid}.*"))
-    ready = [f for f in existing if f.is_file() and f.stat().st_size > 10000]
+    ready = [f for f in existing if f.is_file() and not f.name.endswith(".part") and not f.name.endswith(".ytdl") and f.stat().st_size > 500000]
     if ready:
         target_path = ready[0]
     else:
