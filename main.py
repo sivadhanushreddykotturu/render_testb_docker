@@ -2760,14 +2760,6 @@ def _launch_persistent_ffmpeg():
     global _ffmpeg_hls_proc
     _ensure_hls_dirs()
 
-    # Clean up stale segments and manifest so new stream starts fresh
-    try:
-        for p in HLS_DIR.glob("*.ts"):
-            p.unlink(missing_ok=True)
-        (HLS_DIR / "stream.m3u8").unlink(missing_ok=True)
-    except Exception:
-        pass
-
     # Kill stale process if exists
     if _ffmpeg_hls_proc and _ffmpeg_hls_proc.poll() is None:
         try:
@@ -2788,9 +2780,10 @@ def _launch_persistent_ffmpeg():
         "-c:a", "aac",
         "-b:a", "128k",
         "-f", "hls",
-        "-hls_time", "2",
-        "-hls_list_size", "5",
-        "-hls_flags", "delete_segments+omit_endlist",
+        "-hls_time", "3",
+        "-hls_list_size", "10",
+        "-hls_delete_threshold", "15",
+        "-hls_flags", "delete_segments+append_list+omit_endlist",
         "-hls_segment_filename", str(HLS_DIR / "seg_%05d.ts"),
         str(HLS_DIR / "stream.m3u8"),
     ]
@@ -3108,11 +3101,15 @@ async def radio_hls_manifest():
 @app.get("/api/radio/hls/{segment_name}")
 @app.get("/radio/hls/{segment_name}")
 async def radio_hls_segment(segment_name: str):
-    """Serves 2-second HLS audio segment (edge cached by Cloudflare)."""
+    """Serves HLS audio segment. Gracefully falls back to oldest available segment if expired to avoid player crashes."""
     clean_seg = os.path.basename(segment_name)
     segment_path = HLS_DIR / clean_seg
     if not segment_path.exists() or segment_path.stat().st_size == 0:
-        raise HTTPException(status_code=404, detail="Segment not found.")
+        available = sorted([p for p in HLS_DIR.glob("seg_*.ts") if p.is_file() and p.stat().st_size > 0])
+        if available:
+            segment_path = available[0]
+        else:
+            raise HTTPException(status_code=404, detail="Segment not found.")
 
     return FileResponse(
         path=str(segment_path),

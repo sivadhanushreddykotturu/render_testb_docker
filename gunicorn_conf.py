@@ -18,9 +18,9 @@ timeout = 120
 graceful_timeout = 30
 keepalive = 5
 
-# Recycle workers periodically to bound memory (ONNX runtime et al).
-max_requests = 2000
-max_requests_jitter = 200
+# Keep workers persistent so background radio streaming threads are never killed.
+max_requests = int(os.environ.get("MAX_REQUESTS", "0"))
+max_requests_jitter = 0
 
 # Log to stdout/stderr -> captured by journald under systemd.
 accesslog = "-"
