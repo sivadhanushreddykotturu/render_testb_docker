@@ -2801,7 +2801,7 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
             # Strategy 1: Cloudflare WARP SOCKS5 proxy (bypasses datacenter bot blocks)
             {
                 "proxy": warp_proxy,
-                "format": "ba/b/bestaudio/best",
+                "format": "bestaudio[ext=m4a]/bestaudio[ext=mp3]/ba/b/best",
                 "outtmpl": str(CACHE_DIR / f"{clean_vid}.%(ext)s"),
                 "quiet": True,
                 "no_warnings": True,
@@ -2809,7 +2809,7 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
             },
             # Strategy 2: Direct connection with android/ios client simulation (works locally / residential)
             {
-                "format": "ba/b/bestaudio/18/best",
+                "format": "bestaudio[ext=m4a]/bestaudio[ext=mp3]/18/ba/b/best",
                 "outtmpl": str(CACHE_DIR / f"{clean_vid}.%(ext)s"),
                 "quiet": True,
                 "no_warnings": True,
@@ -2822,7 +2822,7 @@ def _download_radio_audio_track(video_id: str) -> Path | None:
             },
             # Strategy 3: Standard direct fallback without proxy
             {
-                "format": "ba/b/bestaudio/best",
+                "format": "bestaudio[ext=m4a]/bestaudio[ext=mp3]/ba/b/best",
                 "outtmpl": str(CACHE_DIR / f"{clean_vid}.%(ext)s"),
                 "quiet": True,
                 "no_warnings": True,
@@ -3225,14 +3225,70 @@ async def radio_audio_stream(video_id: str, request: Request):
     }
     media_type = media_types.get(ext, "audio/mp4")
 
-    return FileResponse(
-        path=str(target_path),
+    file_size = target_path.stat().st_size
+    range_header = request.headers.get("range")
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=86400",
+        "Access-Control-Allow-Origin": "*",
+    }
+
+    if not range_header:
+        headers["Content-Length"] = str(file_size)
+        return FileResponse(
+            path=str(target_path),
+            media_type=media_type,
+            headers=headers,
+        )
+
+    # Handle Range: bytes=start-end
+    try:
+        range_str = range_header.strip().lower()
+        if range_str.startswith("bytes="):
+            range_str = range_str[6:]
+        parts = range_str.split("-")
+        start = int(parts[0]) if parts[0] else 0
+        end = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
+    except Exception:
+        headers["Content-Length"] = str(file_size)
+        return FileResponse(
+            path=str(target_path),
+            media_type=media_type,
+            headers=headers,
+        )
+
+    if start >= file_size or end >= file_size or start > end:
+        return Response(
+            status_code=416,
+            content=b"",
+            headers={
+                "Content-Range": f"bytes */{file_size}",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    content_length = end - start + 1
+    headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+    headers["Content-Length"] = str(content_length)
+
+    def file_chunk_generator(file_path: str, offset: int, length: int, chunk_size: int = 65536):
+        with open(file_path, "rb") as f:
+            f.seek(offset)
+            remaining = length
+            while remaining > 0:
+                to_read = min(chunk_size, remaining)
+                chunk = f.read(to_read)
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    return StreamingResponse(
+        file_chunk_generator(str(target_path), start, content_length),
+        status_code=206,
         media_type=media_type,
-        headers={
-            "Accept-Ranges": "bytes",
-            "Cache-Control": "public, max-age=86400",
-            "Access-Control-Allow-Origin": "*",
-        },
+        headers=headers,
     )
 
 # ------------------ HLS STREAM ENDPOINTS (BACKWARDS COMPATIBILITY) ------------------
