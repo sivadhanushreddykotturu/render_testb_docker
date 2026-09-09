@@ -2298,93 +2298,10 @@ def _calculate_decayed_score(item: dict, now: float = None) -> float:
     return round(score, 4)
 
 async def _advance_radio_track(force: bool = False) -> dict:
-    """Picks the top-ranked track deterministically (No random lottery) with soft anti-repeat rules."""
-    async with _radio_advance_lock:
-        state = _get_radio_state_doc()
-        now_ms = int(time.time() * 1000)
-        now_sec = time.time()
-
-        current_track = state.get("track")
-        if current_track and not force:
-            duration_ms = int(current_track.get("duration_sec", 0)) * 1000
-            started_at = int(state.get("started_at", 0))
-            if now_ms - started_at < duration_ms:
-                # Track is still playing, do not advance
-                return state
-
-        queue = _get_radio_queue_docs()
-        # Auto-purge any invalid non-music items from the queue
-        valid_queue = []
-        for q in queue:
-            if not _is_allowed_music_track(q.get("title", ""), q.get("artist", "")):
-                _remove_radio_queue_doc(q.get("queue_id"))
-                logger.info(f"[RADIO PURGE] Removed non-music queue item: {q.get('title')}")
-            else:
-                valid_queue.append(q)
-        queue = valid_queue
-
-        if not queue:
-            # Queue is empty, radio goes idle
-            new_state = {
-                "track": None,
-                "started_at": 0,
-                "status": "idle",
-                "reports": [],
-            }
-            _save_radio_state_doc(new_state)
-            logger.info("[RADIO] Queue is empty. Radio is now idle.")
-            return new_state
-
-        # Compute priority score for all items in queue
-        for item in queue:
-            item["score"] = _calculate_decayed_score(item, now_sec)
-
-        # Sort strictly: Highest score first; on ties, earliest submitted (added_at) first
-        queue.sort(key=lambda x: (x["score"], -x.get("added_at", 0)), reverse=True)
-
-        # Anti-repeat check: avoid playing exact same artist or submitter back-to-back if other options exist
-        recent_history = _get_recent_radio_history(since_sec=RADIO_ANTI_REPEAT_SEC)
-        recent_artists = {h.get("artist", "").strip().lower() for h in recent_history if h.get("artist")}
-        recent_submitters = {h.get("added_by", "").strip() for h in recent_history if h.get("added_by")}
-
-        chosen = None
-        for candidate in queue:
-            cand_artist = candidate.get("artist", "").strip().lower()
-            cand_user = candidate.get("added_by", "").strip()
-            # If queue has multiple items, skip candidate if they just played in the last track
-            if len(queue) > 1 and (cand_artist in recent_artists or cand_user in recent_submitters):
-                continue
-            chosen = candidate
-            break
-
-        # Fallback to #1 in queue if all candidates violated soft anti-repeat
-        if not chosen:
-            chosen = queue[0]
-
-        # Remove chosen from queue
-        _remove_radio_queue_doc(chosen["queue_id"])
-
-        # Add to history
-        _add_radio_history_doc(chosen)
-
-        # Set as current track
-        new_state = {
-            "track": {
-                "videoId": chosen["videoId"],
-                "title": chosen["title"],
-                "artist": chosen["artist"],
-                "duration_sec": chosen["duration_sec"],
-                "duration_text": chosen.get("duration_text", ""),
-                "thumbnail": chosen.get("thumbnail", ""),
-                "added_by": chosen.get("added_by", "anonymous"),
-            },
-            "started_at": now_ms,
-            "status": "playing",
-            "reports": [],
-        }
-        _save_radio_state_doc(new_state)
-        logger.info(f"[RADIO] 🎵 Now playing: '{chosen['title']}' by {chosen['artist']} (queued by {chosen.get('added_by')})")
-        return new_state
+    """Under live HLS streaming, the background worker thread is the single authority. Wakes worker if force=True."""
+    if force:
+        _radio_wake_event.set()
+    return await _get_current_radio_state()
 
 async def _get_current_radio_state(user_id: str = "") -> dict:
     """Returns the synchronized radio state driven by the live HLS streamer worker."""
@@ -2843,11 +2760,11 @@ def _launch_persistent_ffmpeg():
     global _ffmpeg_hls_proc
     _ensure_hls_dirs()
 
-    # Clean up stale/corrupt 0-byte segments from previous crashes or restarts
+    # Clean up stale segments and manifest so new stream starts fresh
     try:
         for p in HLS_DIR.glob("*.ts"):
-            if p.is_file() and p.stat().st_size == 0:
-                p.unlink(missing_ok=True)
+            p.unlink(missing_ok=True)
+        (HLS_DIR / "stream.m3u8").unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -2862,6 +2779,8 @@ def _launch_persistent_ffmpeg():
     cmd = [
         "ffmpeg",
         "-y",
+        "-nostats",
+        "-loglevel", "error",
         "-f", "s16le",
         "-ar", str(SAMPLE_RATE),
         "-ac", str(CHANNELS),
@@ -2881,7 +2800,7 @@ def _launch_persistent_ffmpeg():
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
         logger.info("[HLS STREAMER] Persistent FFmpeg daemon launched successfully.")
         return _ffmpeg_hls_proc
@@ -3051,6 +2970,8 @@ def _hls_radio_worker_thread():
 
                     decode_cmd = [
                         "ffmpeg",
+                        "-nostats",
+                        "-loglevel", "error",
                         "-i", str(audio_file),
                         "-f", "s16le",
                         "-ar", str(SAMPLE_RATE),
@@ -3085,7 +3006,10 @@ def _hls_radio_worker_thread():
 
                         # Drift-free pacing
                         next_chunk_time += len(pcm_data) / BYTES_PER_SEC
-                        sleep_duration = max(0.0, next_chunk_time - time.monotonic())
+                        now_mono = time.monotonic()
+                        if now_mono - next_chunk_time > 0.5:
+                            next_chunk_time = now_mono
+                        sleep_duration = min(0.2, max(0.0, next_chunk_time - now_mono))
                         if sleep_duration > 0:
                             time.sleep(sleep_duration)
 
