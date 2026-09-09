@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Form, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import httpx
@@ -211,7 +211,11 @@ def make_erp_client(http2: bool = True, **overrides) -> httpx.AsyncClient:
 # ------------------ GLOBAL CONNECTION LIFESPAN ------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global gateway_manager
+    global gateway_manager, _main_asyncio_loop
+    try:
+        _main_asyncio_loop = asyncio.get_running_loop()
+    except Exception:
+        pass
     logger.info("✅ FastAPI app starting (AWS API Gateway IP-Rotation Engine)...")
 
     # Start gateways ONCE for the whole process lifetime. boto3 calls are
@@ -1811,6 +1815,31 @@ RADIO_ANTI_REPEAT_SEC = 2700  # 45 minutes anti-repeat window
 _radio_advance_lock = asyncio.Lock()
 _radio_wake_event = threading.Event()
 
+# ------------------ Radio Real-Time Server-Sent Events (SSE) ------------------
+_sse_clients: set[asyncio.Queue] = set()
+_sse_mutex = threading.Lock()
+_main_asyncio_loop: asyncio.AbstractEventLoop | None = None
+
+def broadcast_radio_event(event_type: str, data: dict):
+    """Safely dispatches a real-time event to all connected SSE clients from any thread or async handler."""
+    payload = {
+        "event": event_type,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    with _sse_mutex:
+        subscribers = list(_sse_clients)
+    if not subscribers:
+        return
+    for q in subscribers:
+        try:
+            if _main_asyncio_loop and _main_asyncio_loop.is_running():
+                _main_asyncio_loop.call_soon_threadsafe(q.put_nowait, payload)
+            else:
+                q.put_nowait(payload)
+        except Exception:
+            pass
+
 # ------------------ Radio In-Memory State & Fallback ------------------
 _mem_radio_state = {
     "track": None,         # dict or None
@@ -2536,7 +2565,9 @@ async def radio_add_queue(
     _radio_wake_event.set()
     _select_and_lock_next_track()
 
-    return await _get_current_radio_state(user_id=user_id)
+    updated = await _get_current_radio_state(user_id=user_id)
+    broadcast_radio_event("queue_update", updated)
+    return updated
 
 @app.post("/api/radio/vote")
 @app.post("/radio/vote")
@@ -2569,7 +2600,9 @@ async def radio_vote(
     _update_radio_queue_votes(queue_id, votes)
     logger.info(f"[RADIO] {user_id} upvoted {target_item.get('title')} (total votes: {len(votes)})")
 
-    return await _get_current_radio_state(user_id=user_id)
+    updated = await _get_current_radio_state(user_id=user_id)
+    broadcast_radio_event("queue_update", updated)
+    return updated
 
 @app.post("/api/radio/report")
 @app.post("/radio/report")
@@ -2608,14 +2641,57 @@ async def radio_report(
         logger.info(f"[RADIO] Report threshold reached ({len(reports)}). Force-skipping track...")
         await _advance_radio_track(force=True)
 
-    return await _get_current_radio_state(user_id=user_id)
+    updated = await _get_current_radio_state(user_id=user_id)
+    broadcast_radio_event("track_update", updated)
+    return updated
 
 @app.post("/api/radio/advance")
 @app.post("/radio/advance")
 async def radio_advance():
     """Advances to the next track if the current song has completed."""
     await _advance_radio_track(force=False)
-    return await _get_current_radio_state()
+    updated = await _get_current_radio_state()
+    return updated
+
+@app.get("/api/radio/stream-events")
+@app.get("/radio/stream-events")
+async def radio_stream_events(request: Request):
+    """Server-Sent Events (SSE) stream pushing real-time track changes, queue updates, and sync data."""
+    async def event_generator():
+        client_queue = asyncio.Queue(maxsize=100)
+        with _sse_mutex:
+            _sse_clients.add(client_queue)
+
+        try:
+            # 1. Send initial sync snapshot immediately upon connection
+            init_state = await _get_current_radio_state()
+            yield f"event: sync\ndata: {json.dumps(init_state)}\n\n"
+
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    msg = await asyncio.wait_for(client_queue.get(), timeout=15.0)
+                    yield f"event: {msg['event']}\ndata: {json.dumps(msg['data'])}\n\n"
+                except asyncio.TimeoutError:
+                    # Keep-alive heartbeat comment every 15s to keep NAT/proxies active
+                    yield ": ping\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            with _sse_mutex:
+                _sse_clients.discard(client_queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 # ============================================================
 # HLS LIVE RADIO STREAMING ENGINE (PERSISTENT FFMPEG + YT-DLP)
@@ -2979,6 +3055,30 @@ def _hls_radio_worker_thread():
                     # Immediately select and lock the second song ahead of time,
                     # ensuring ratings/votes won't affect it once locked, and pre-download it immediately.
                     _select_and_lock_next_track()
+
+                    # Broadcast track_start to all connected SSE clients
+                    try:
+                        current_queue = _get_radio_queue_docs()
+                        now_sec = time.time()
+                        for it in current_queue:
+                            it["score"] = _calculate_decayed_score(it, now_sec)
+                            it["votes_count"] = len(it.get("votes", []))
+                            it["is_locked"] = bool(_next_locked_track and it.get("queue_id") == _next_locked_track.get("queue_id"))
+                        current_queue.sort(key=lambda x: (x["score"], -x.get("added_at", 0)), reverse=True)
+                        recent_hist = _get_recent_radio_history(limit=10)
+                        broadcast_radio_event("track_start", {
+                            "success": True,
+                            "server_time": now_ms,
+                            "status": "playing",
+                            "started_at": now_ms,
+                            "elapsed_ms": 0,
+                            "current_track": new_state["track"],
+                            "reports_count": 0,
+                            "queue": current_queue,
+                            "recent_history": recent_hist,
+                        })
+                    except Exception as b_err:
+                        logger.warning(f"[HLS STREAMER] SSE broadcast error: {b_err}")
 
                     decode_cmd = [
                         "ffmpeg",
