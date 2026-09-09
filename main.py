@@ -2933,7 +2933,26 @@ def _hls_radio_worker_thread():
             if chosen_track:
                 vid = chosen_track["videoId"]
 
-                audio_file = _download_radio_audio_track(vid)
+                # Ensure track is downloaded without freezing FFmpeg stream
+                audio_file = None
+                for _ in range(300):  # Wait up to 30s for download to complete
+                    existing = list(CACHE_DIR.glob(f"{vid.strip()}.*"))
+                    ready = [f for f in existing if f.is_file() and f.stat().st_size > 10000]
+                    if ready:
+                        audio_file = ready[0]
+                        break
+                    # Feed 100ms comfort silence so HLS segments never freeze or starve while waiting
+                    silent_chunk = b"\x00" * CHUNK_SIZE
+                    try:
+                        ffmpeg_proc.stdin.write(silent_chunk)
+                        ffmpeg_proc.stdin.flush()
+                    except Exception:
+                        ffmpeg_proc = _launch_persistent_ffmpeg()
+                    time.sleep(0.095)
+
+                if not audio_file:
+                    audio_file = _download_radio_audio_track(vid)
+
                 if audio_file and audio_file.exists():
                     now_ms = int(time.time() * 1000)
                     _hls_current_track = chosen_track
@@ -2975,8 +2994,9 @@ def _hls_radio_worker_thread():
                     decoder_proc = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
                     track_duration_sec = max(30.0, float(chosen_track.get("duration_sec", 180)))
-                    streamed_bytes = 0
-                    next_chunk_time = time.monotonic()
+                    track_start_mono = time.monotonic()
+                    total_chunks_sent = 0
+                    chunk_duration = CHUNK_SIZE / BYTES_PER_SEC
 
                     while True:
                         pcm_data = decoder_proc.stdout.read(CHUNK_SIZE)
@@ -2995,16 +3015,12 @@ def _hls_radio_worker_thread():
                             except Exception:
                                 break
 
-                        streamed_bytes += len(pcm_data)
-
-                        # Drift-free pacing
-                        next_chunk_time += len(pcm_data) / BYTES_PER_SEC
-                        now_mono = time.monotonic()
-                        if now_mono - next_chunk_time > 0.5:
-                            next_chunk_time = now_mono
-                        sleep_duration = min(0.2, max(0.0, next_chunk_time - now_mono))
-                        if sleep_duration > 0:
-                            time.sleep(sleep_duration)
+                        total_chunks_sent += 1
+                        expected_elapsed = total_chunks_sent * chunk_duration
+                        actual_elapsed = time.monotonic() - track_start_mono
+                        delay = expected_elapsed - actual_elapsed
+                        if delay > 0:
+                            time.sleep(delay)
 
                     decoder_proc.wait()
                     logger.info(f"[HLS STREAMER] Finished track: '{chosen_track.get('title')}'.")
