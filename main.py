@@ -2915,7 +2915,7 @@ DEFAULT_CAMPUS_PLAYLIST = [
     {"videoId": "5U5Ru0nTiUM", "title": "Tere Liye (Prince)", "artist": "Atif Aslam, Shreya Ghoshal", "duration_sec": 280, "duration_text": "4:40", "thumbnail": "https://yt3.googleusercontent.com/8rcPUY_axCJpmXE7z1tW3ipwgiVVJBmkH05BZTbzUkQ1zYooRjIb2Zfoqj9_hdQPIp0wuV3NJmMbLVA=w120-h120-l90-rj", "added_by": "Campus Radio 📻"},
     {"videoId": "vL14wk2cj6U", "title": "Ik Vaari Aa (Raabta)", "artist": "Arijit Singh, Pritam", "duration_sec": 275, "duration_text": "4:35", "thumbnail": "https://yt3.googleusercontent.com/dnMA___8pamFIWq2DbTLFGkgeChz0phQBf-5TRverJ1ud7S1D3DdSphnd10iAnzl_kfttN1w4Z9IZQ80=w120-h120-l90-rj", "added_by": "Campus Radio 📻"},
     {"videoId": "k3g_Wj7474U", "title": "Sajni (Laapataa Ladies)", "artist": "Arijit Singh, Ram Sampath", "duration_sec": 170, "duration_text": "2:50", "thumbnail": "https://i.ytimg.com/vi/k3g_Wj7474U/hqdefault.jpg", "added_by": "Campus Radio 📻"},
-    {"videoId": "dZ0fwJojhrs", "title": "Pehle Bhi Main (Animal)", "artist": "Vishal Mishra, Harshavardhan Rameshwar", "duration_sec": 250, "duration_text": "4:10", "thumbnail": "https://i.ytimg.com/vi/dZ0fwJojhrs/hqdefault.jpg", "added_by": "Campus Radio 📻"},
+    {"videoId": "QiaaE20wqlE", "title": "Pehle Bhi Main (Animal)", "artist": "Vishal Mishra, Harshavardhan Rameshwar", "duration_sec": 250, "duration_text": "4:10", "thumbnail": "https://i.ytimg.com/vi/QiaaE20wqlE/hqdefault.jpg", "added_by": "Campus Radio 📻"},
     {"videoId": "VAdGW7QDJUI", "title": "Chaleya (Jawan)", "artist": "Arijit Singh, Shilpa Rao, Anirudh", "duration_sec": 200, "duration_text": "3:20", "thumbnail": "https://i.ytimg.com/vi/VAdGW7QDJUI/hqdefault.jpg", "added_by": "Campus Radio 📻"},
     {"videoId": "BddP6PYo2gs", "title": "Kesariya (Brahmastra)", "artist": "Arijit Singh, Pritam", "duration_sec": 268, "duration_text": "4:28", "thumbnail": "https://i.ytimg.com/vi/BddP6PYo2gs/hqdefault.jpg", "added_by": "Campus Radio 📻"},
     {"videoId": "iAIBF2ngbWY", "title": "O Maahi (Dunki)", "artist": "Arijit Singh, Pritam", "duration_sec": 233, "duration_text": "3:53", "thumbnail": "https://i.ytimg.com/vi/iAIBF2ngbWY/hqdefault.jpg", "added_by": "Campus Radio 📻"},
@@ -3204,18 +3204,30 @@ async def radio_audio_stream(video_id: str, request: Request):
         raise HTTPException(status_code=400, detail="Invalid audio track ID.")
 
     _ensure_hls_dirs()
-    target_path = CACHE_DIR / f"{clean_vid}.m4a"
+    existing = list(CACHE_DIR.glob(f"{clean_vid}.*"))
+    ready = [f for f in existing if f.is_file() and f.stat().st_size > 10000]
+    if ready:
+        target_path = ready[0]
+    else:
+        target_path = await asyncio.to_thread(_download_radio_audio_track, clean_vid)
 
-    # If not yet cached, attempt to download immediately
-    if not target_path.exists() or target_path.stat().st_size < 10000:
-        downloaded = await asyncio.to_thread(_download_radio_audio_track, clean_vid)
-        if not downloaded or not downloaded.exists():
-            raise HTTPException(status_code=404, detail="Audio track unavailable.")
-        target_path = downloaded
+    if not target_path or not target_path.exists():
+        raise HTTPException(status_code=404, detail="Audio track unavailable.")
+
+    ext = target_path.suffix.lower()
+    media_types = {
+        ".m4a": "audio/mp4",
+        ".mp4": "audio/mp4",
+        ".webm": "audio/webm",
+        ".opus": "audio/ogg",
+        ".ogg": "audio/ogg",
+        ".mp3": "audio/mpeg",
+    }
+    media_type = media_types.get(ext, "audio/mp4")
 
     return FileResponse(
         path=str(target_path),
-        media_type="audio/mp4",
+        media_type=media_type,
         headers={
             "Accept-Ranges": "bytes",
             "Cache-Control": "public, max-age=86400",
