@@ -2366,13 +2366,32 @@ async def _get_current_radio_state(user_id: str = "") -> dict:
     # Retrieve last 10 played tracks
     recent_history = _get_recent_radio_history(limit=10)
 
+    current_track = state.get("track")
+    if current_track and current_track.get("videoId"):
+        current_track = dict(current_track)
+        current_track["audio_url"] = f"/api/radio/audio/{current_track['videoId']}.m4a"
+
+    next_track_info = None
+    if _next_locked_track and _next_locked_track.get("videoId"):
+        next_track_info = {
+            "videoId": _next_locked_track.get("videoId"),
+            "title": _next_locked_track.get("title"),
+            "artist": _next_locked_track.get("artist"),
+            "duration_sec": _next_locked_track.get("duration_sec"),
+            "duration_text": _next_locked_track.get("duration_text", ""),
+            "thumbnail": _next_locked_track.get("thumbnail", ""),
+            "added_by": _next_locked_track.get("added_by", "Campus Radio 📻"),
+            "audio_url": f"/api/radio/audio/{_next_locked_track['videoId']}.m4a",
+        }
+
     return {
         "success": True,
         "server_time": now_ms,
         "status": state.get("status", "idle"),
         "started_at": state.get("started_at", 0),
         "elapsed_ms": elapsed_ms,
-        "current_track": state.get("track"),
+        "current_track": current_track,
+        "next_track": next_track_info,
         "reports_count": len(state.get("reports", [])),
         "queue": queue,
         "recent_history": recent_history,
@@ -2963,17 +2982,12 @@ def _select_and_lock_next_track():
     return _next_locked_track
 
 def _hls_radio_worker_thread():
-    """Continuous dedicated background daemon thread feeding raw PCM chunks into persistent FFmpeg."""
-    global _ffmpeg_hls_proc, _hls_current_track, _next_locked_track
+    """Direct Synchronized Track Streaming daemon. Coordinates real-time track progression and SSE broadcasts."""
+    global _hls_current_track, _next_locked_track
     _ensure_hls_dirs()
-    time.sleep(2)
+    time.sleep(1)
 
-    ffmpeg_proc = _launch_persistent_ffmpeg()
-    if not ffmpeg_proc or not ffmpeg_proc.stdin:
-        logger.warning("[HLS STREAMER] FFmpeg not available. HLS streamer worker dormant.")
-        return
-
-    logger.info("[HLS STREAMER] Live HLS Radio background worker thread active.")
+    logger.info("[RADIO MASTER] Direct Synchronized Track Streaming daemon active.")
 
     while True:
         try:
@@ -2999,34 +3013,23 @@ def _hls_radio_worker_thread():
                         duration_ms = int(curr.get("duration_sec", 0)) * 1000
                         if started_at > 0 and (now_ms - started_at) < duration_ms:
                             chosen_track = curr
-                            logger.info(f"[HLS STREAMER] Resuming active track from DB: '{chosen_track.get('title')}'")
+                            logger.info(f"[RADIO MASTER] Resuming active track from DB: '{chosen_track.get('title')}'")
 
                     # If still no track, pick next from 24/7 continuous default campus playlist
                     if chosen_track is None:
                         chosen_track = _pick_next_fallback_track()
-                        logger.info(f"[HLS STREAMER] 📻 Auto-playing from 24/7 campus playlist: '{chosen_track.get('title')}'")
+                        logger.info(f"[RADIO MASTER] 📻 Auto-playing from 24/7 campus playlist: '{chosen_track.get('title')}'")
 
             if chosen_track:
                 vid = chosen_track["videoId"]
 
-                # Ensure track is downloaded without freezing FFmpeg stream
+                # Ensure track audio file is downloaded to cache
                 audio_file = None
-                for _ in range(300):  # Wait up to 30s for download to complete
-                    existing = list(CACHE_DIR.glob(f"{vid.strip()}.*"))
-                    ready = [f for f in existing if f.is_file() and f.stat().st_size > 10000]
-                    if ready:
-                        audio_file = ready[0]
-                        break
-                    # Feed 100ms comfort silence so HLS segments never freeze or starve while waiting
-                    silent_chunk = b"\x00" * CHUNK_SIZE
-                    try:
-                        ffmpeg_proc.stdin.write(silent_chunk)
-                        ffmpeg_proc.stdin.flush()
-                    except Exception:
-                        ffmpeg_proc = _launch_persistent_ffmpeg()
-                    time.sleep(0.095)
-
-                if not audio_file:
+                existing = list(CACHE_DIR.glob(f"{vid.strip()}.*"))
+                ready = [f for f in existing if f.is_file() and f.stat().st_size > 10000]
+                if ready:
+                    audio_file = ready[0]
+                else:
                     audio_file = _download_radio_audio_track(vid)
 
                 if audio_file and audio_file.exists():
@@ -3041,6 +3044,7 @@ def _hls_radio_worker_thread():
                             "duration_text": chosen_track.get("duration_text", ""),
                             "thumbnail": chosen_track.get("thumbnail", ""),
                             "added_by": chosen_track.get("added_by", "anonymous"),
+                            "audio_url": f"/api/radio/audio/{chosen_track['videoId']}.m4a",
                         },
                         "started_at": now_ms,
                         "status": "playing",
@@ -3052,9 +3056,23 @@ def _hls_radio_worker_thread():
                     _add_radio_history_doc(chosen_track)
 
                     # AS SOON AS THE CURRENT SONG STARTS PLAYING:
-                    # Immediately select and lock the second song ahead of time,
-                    # ensuring ratings/votes won't affect it once locked, and pre-download it immediately.
+                    # Immediately select and lock the next song ahead of time,
+                    # and pre-download it immediately into CACHE_DIR.
                     _select_and_lock_next_track()
+
+                    # Next track info for preloading & UI preview
+                    next_track_info = None
+                    if _next_locked_track and _next_locked_track.get("videoId"):
+                        next_track_info = {
+                            "videoId": _next_locked_track.get("videoId"),
+                            "title": _next_locked_track.get("title"),
+                            "artist": _next_locked_track.get("artist"),
+                            "duration_sec": _next_locked_track.get("duration_sec"),
+                            "duration_text": _next_locked_track.get("duration_text", ""),
+                            "thumbnail": _next_locked_track.get("thumbnail", ""),
+                            "added_by": _next_locked_track.get("added_by", "Campus Radio 📻"),
+                            "audio_url": f"/api/radio/audio/{_next_locked_track['videoId']}.m4a",
+                        }
 
                     # Broadcast track_start to all connected SSE clients
                     try:
@@ -3073,96 +3091,55 @@ def _hls_radio_worker_thread():
                             "started_at": now_ms,
                             "elapsed_ms": 0,
                             "current_track": new_state["track"],
+                            "next_track": next_track_info,
                             "reports_count": 0,
                             "queue": current_queue,
                             "recent_history": recent_hist,
                         })
                     except Exception as b_err:
-                        logger.warning(f"[HLS STREAMER] SSE broadcast error: {b_err}")
-
-                    decode_cmd = [
-                        "ffmpeg",
-                        "-nostats",
-                        "-loglevel", "error",
-                        "-i", str(audio_file),
-                        "-f", "s16le",
-                        "-ar", str(SAMPLE_RATE),
-                        "-ac", str(CHANNELS),
-                        "-vn",
-                        "pipe:1"
-                    ]
-                    decoder_proc = subprocess.Popen(decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                        logger.warning(f"[RADIO MASTER] SSE broadcast error: {b_err}")
 
                     track_duration_sec = max(30.0, float(chosen_track.get("duration_sec", 180)))
-                    track_start_mono = time.monotonic()
-                    total_chunks_sent = 0
-                    chunk_duration = CHUNK_SIZE / BYTES_PER_SEC
+                    logger.info(f"[RADIO MASTER] 🎵 Live track '{chosen_track.get('title')}' started ({track_duration_sec:.0f}s). Synchronized to all clients.")
 
-                    while True:
-                        pcm_data = decoder_proc.stdout.read(CHUNK_SIZE)
-                        if not pcm_data:
-                            break
-                        try:
-                            ffmpeg_proc.stdin.write(pcm_data)
-                            ffmpeg_proc.stdin.flush()
-                        except (BrokenPipeError, OSError):
-                            ffmpeg_proc = _launch_persistent_ffmpeg()
-                            if not ffmpeg_proc or not ffmpeg_proc.stdin:
-                                break
+                    # Phase 1: Sleep until 15s before track end (interruptible by report/skip)
+                    wait_phase1 = max(0.0, track_duration_sec - 15.0)
+                    interrupted = _radio_wake_event.wait(timeout=wait_phase1)
+                    _radio_wake_event.clear()
+
+                    if not interrupted:
+                        # Phase 2: Push preload_next to all clients so they pre-cache the next song
+                        if next_track_info:
                             try:
-                                ffmpeg_proc.stdin.write(pcm_data)
-                                ffmpeg_proc.stdin.flush()
+                                broadcast_radio_event("preload_next", {
+                                    "next_track": next_track_info,
+                                })
                             except Exception:
-                                break
+                                pass
 
-                        total_chunks_sent += 1
-                        expected_elapsed = total_chunks_sent * chunk_duration
-                        actual_elapsed = time.monotonic() - track_start_mono
-                        delay = expected_elapsed - actual_elapsed
-                        if delay > 0:
-                            time.sleep(delay)
+                        # Sleep remaining 15 seconds
+                        _radio_wake_event.wait(timeout=min(15.0, track_duration_sec))
+                        _radio_wake_event.clear()
 
-                    decoder_proc.wait()
-                    logger.info(f"[HLS STREAMER] Finished track: '{chosen_track.get('title')}'.")
-
-                    # Post-play cleanup for this specific track
-                    try:
-                        audio_file.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    logger.info(f"[RADIO MASTER] Track '{chosen_track.get('title')}' playback completed. Advancing.")
                     _hls_current_track = None
                 else:
                     _hls_current_track = None
-                    logger.warning(f"[HLS STREAMER] Download not ready or failed for: '{chosen_track.get('title')}'")
+                    logger.warning(f"[RADIO MASTER] Download not ready or failed for: '{chosen_track.get('title')}'")
                     if chosen_track.get("queue_id"):
                         fail_count = chosen_track.get("fail_count", 0) + 1
                         chosen_track["fail_count"] = fail_count
                         if fail_count >= 2:
                             _remove_radio_queue_doc(chosen_track["queue_id"])
-                            logger.info(f"[HLS STREAMER] Removed failed track from queue after retries: '{chosen_track.get('title')}'")
-                    # Feed comfort silence for 2 seconds while moving to next track so stream never halts
-                    for _ in range(20):
-                        silent_chunk = b"\x00" * CHUNK_SIZE
-                        try:
-                            ffmpeg_proc.stdin.write(silent_chunk)
-                            ffmpeg_proc.stdin.flush()
-                        except Exception:
-                            ffmpeg_proc = _launch_persistent_ffmpeg()
-                            break
-                        time.sleep(0.095)
+                            logger.info(f"[RADIO MASTER] Removed failed track from queue after retries: '{chosen_track.get('title')}'")
+                    time.sleep(1)
             else:
                 _hls_current_track = None
-                silent_chunk = b"\x00" * CHUNK_SIZE
-                try:
-                    ffmpeg_proc.stdin.write(silent_chunk)
-                    ffmpeg_proc.stdin.flush()
-                except (BrokenPipeError, OSError):
-                    ffmpeg_proc = _launch_persistent_ffmpeg()
-                _radio_wake_event.wait(timeout=0.095)
+                _radio_wake_event.wait(timeout=2.0)
                 _radio_wake_event.clear()
 
         except Exception as e:
-            logger.error(f"[HLS STREAMER] Thread exception: {e}")
+            logger.error(f"[RADIO MASTER] Thread exception: {e}")
             time.sleep(1)
 
 _streamer_lock_file = None
@@ -3188,7 +3165,42 @@ def _start_hls_streamer_thread():
     t = threading.Thread(target=_hls_radio_worker_thread, daemon=True, name="HlsRadioStreamerThread")
     t.start()
 
-# ------------------ HLS STREAM ENDPOINTS ------------------
+# ------------------ DIRECT SYNCHRONIZED AUDIO STREAMING ------------------
+
+@app.get("/api/radio/audio/{video_id}")
+@app.get("/api/radio/audio/{video_id}.m4a")
+@app.get("/radio/audio/{video_id}")
+@app.get("/radio/audio/{video_id}.m4a")
+async def radio_audio_stream(video_id: str, request: Request):
+    """
+    Direct high-performance audio streaming endpoint with native HTTP Range (206 Partial Content) support.
+    Allows phones and desktop browsers to buffer full songs or range chunks instantly.
+    """
+    clean_vid = os.path.basename(video_id).replace(".m4a", "").strip()
+    if not clean_vid:
+        raise HTTPException(status_code=400, detail="Invalid audio track ID.")
+
+    _ensure_hls_dirs()
+    target_path = CACHE_DIR / f"{clean_vid}.m4a"
+
+    # If not yet cached, attempt to download immediately
+    if not target_path.exists() or target_path.stat().st_size < 10000:
+        downloaded = await asyncio.to_thread(_download_radio_audio_track, clean_vid)
+        if not downloaded or not downloaded.exists():
+            raise HTTPException(status_code=404, detail="Audio track unavailable.")
+        target_path = downloaded
+
+    return FileResponse(
+        path=str(target_path),
+        media_type="audio/mp4",
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=86400",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+# ------------------ HLS STREAM ENDPOINTS (BACKWARDS COMPATIBILITY) ------------------
 
 @app.get("/api/radio/hls/stream.m3u8")
 @app.get("/radio/hls/stream.m3u8")
