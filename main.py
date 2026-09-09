@@ -2371,8 +2371,8 @@ async def _get_current_radio_state(user_id: str = "") -> dict:
         current_track = dict(current_track)
         current_track["audio_url"] = f"/api/radio/audio/{current_track['videoId']}.m4a"
 
-    next_track_info = None
-    if _next_locked_track and _next_locked_track.get("videoId"):
+    next_track_info = state.get("next_track")
+    if not next_track_info and _next_locked_track and _next_locked_track.get("videoId"):
         next_track_info = {
             "videoId": _next_locked_track.get("videoId"),
             "title": _next_locked_track.get("title"),
@@ -2988,10 +2988,14 @@ def _hls_radio_worker_thread():
     time.sleep(1)
 
     logger.info("[RADIO MASTER] Direct Synchronized Track Streaming daemon active.")
+    is_initial_start = True
 
     while True:
         try:
             chosen_track = None
+            is_resumed_session = False
+            resumed_started_at = 0
+
             if _next_locked_track:
                 chosen_track = _next_locked_track
                 _next_locked_track = None
@@ -3003,25 +3007,36 @@ def _hls_radio_worker_thread():
                         it["score"] = _calculate_decayed_score(it, now_sec)
                     queue.sort(key=lambda x: (x["score"], -x.get("added_at", 0)), reverse=True)
                     chosen_track = queue[0]
-                else:
-                    # If queue is empty, check if DB state has a track currently within its playback window
+                elif is_initial_start:
+                    # ONLY on worker process launch, check if DB state has a track currently within its playback window
                     state = _get_radio_state_doc()
                     if state.get("status") == "playing" and state.get("track") and _hls_current_track is None:
                         curr = state.get("track")
                         now_ms = int(time.time() * 1000)
                         started_at = int(state.get("started_at", 0))
                         duration_ms = int(curr.get("duration_sec", 0)) * 1000
-                        if started_at > 0 and (now_ms - started_at) < duration_ms:
+                        # Must have at least 10s remaining to resume from DB
+                        if started_at > 0 and (now_ms - started_at) < (duration_ms - 10000):
                             chosen_track = curr
-                            logger.info(f"[RADIO MASTER] Resuming active track from DB: '{chosen_track.get('title')}'")
+                            is_resumed_session = True
+                            resumed_started_at = started_at
+                            logger.info(f"[RADIO MASTER] Resuming active track from DB on startup: '{chosen_track.get('title')}'")
 
-                    # If still no track, pick next from 24/7 continuous default campus playlist
-                    if chosen_track is None:
-                        chosen_track = _pick_next_fallback_track()
-                        logger.info(f"[RADIO MASTER] 📻 Auto-playing from 24/7 campus playlist: '{chosen_track.get('title')}'")
+                # If still no track, pick next from 24/7 continuous default campus playlist
+                if chosen_track is None:
+                    chosen_track = _pick_next_fallback_track()
+                    logger.info(f"[RADIO MASTER] 📻 Auto-playing from 24/7 campus playlist: '{chosen_track.get('title')}'")
+
+            is_initial_start = False
 
             if chosen_track:
                 vid = chosen_track["videoId"]
+
+                # Ensure track is recorded in recent history to prevent repeat selection
+                if vid and vid not in _recent_fallback_vids:
+                    _recent_fallback_vids.append(vid)
+                    if len(_recent_fallback_vids) > 15:
+                        _recent_fallback_vids.pop(0)
 
                 # Ensure track audio file is downloaded to cache
                 audio_file = None
@@ -3035,25 +3050,7 @@ def _hls_radio_worker_thread():
                 if audio_file and audio_file.exists():
                     now_ms = int(time.time() * 1000)
                     _hls_current_track = chosen_track
-                    new_state = {
-                        "track": {
-                            "videoId": chosen_track["videoId"],
-                            "title": chosen_track["title"],
-                            "artist": chosen_track["artist"],
-                            "duration_sec": chosen_track["duration_sec"],
-                            "duration_text": chosen_track.get("duration_text", ""),
-                            "thumbnail": chosen_track.get("thumbnail", ""),
-                            "added_by": chosen_track.get("added_by", "anonymous"),
-                            "audio_url": f"/api/radio/audio/{chosen_track['videoId']}.m4a",
-                        },
-                        "started_at": now_ms,
-                        "status": "playing",
-                        "reports": [],
-                    }
-                    _save_radio_state_doc(new_state)
-                    if chosen_track.get("queue_id"):
-                        _remove_radio_queue_doc(chosen_track["queue_id"])
-                    _add_radio_history_doc(chosen_track)
+                    track_started_at = resumed_started_at if (is_resumed_session and resumed_started_at > 0) else now_ms
 
                     # AS SOON AS THE CURRENT SONG STARTS PLAYING:
                     # Immediately select and lock the next song ahead of time,
@@ -3074,6 +3071,27 @@ def _hls_radio_worker_thread():
                             "audio_url": f"/api/radio/audio/{_next_locked_track['videoId']}.m4a",
                         }
 
+                    new_state = {
+                        "track": {
+                            "videoId": chosen_track["videoId"],
+                            "title": chosen_track["title"],
+                            "artist": chosen_track["artist"],
+                            "duration_sec": chosen_track["duration_sec"],
+                            "duration_text": chosen_track.get("duration_text", ""),
+                            "thumbnail": chosen_track.get("thumbnail", ""),
+                            "added_by": chosen_track.get("added_by", "anonymous"),
+                            "audio_url": f"/api/radio/audio/{chosen_track['videoId']}.m4a",
+                        },
+                        "next_track": next_track_info,
+                        "started_at": track_started_at,
+                        "status": "playing",
+                        "reports": [],
+                    }
+                    _save_radio_state_doc(new_state)
+                    if chosen_track.get("queue_id"):
+                        _remove_radio_queue_doc(chosen_track["queue_id"])
+                    _add_radio_history_doc(chosen_track)
+
                     # Broadcast track_start to all connected SSE clients
                     try:
                         current_queue = _get_radio_queue_docs()
@@ -3088,8 +3106,8 @@ def _hls_radio_worker_thread():
                             "success": True,
                             "server_time": now_ms,
                             "status": "playing",
-                            "started_at": now_ms,
-                            "elapsed_ms": 0,
+                            "started_at": track_started_at,
+                            "elapsed_ms": max(0, now_ms - track_started_at),
                             "current_track": new_state["track"],
                             "next_track": next_track_info,
                             "reports_count": 0,
@@ -3102,8 +3120,11 @@ def _hls_radio_worker_thread():
                     track_duration_sec = max(30.0, float(chosen_track.get("duration_sec", 180)))
                     logger.info(f"[RADIO MASTER] 🎵 Live track '{chosen_track.get('title')}' started ({track_duration_sec:.0f}s). Synchronized to all clients.")
 
+                    # Calculate exact target end time using wall-clock
+                    target_end_sec = (track_started_at / 1000.0) + track_duration_sec
+
                     # Phase 1: Sleep until 15s before track end (interruptible by report/skip)
-                    wait_phase1 = max(0.0, track_duration_sec - 15.0)
+                    wait_phase1 = max(0.0, (target_end_sec - 15.0) - time.time())
                     interrupted = _radio_wake_event.wait(timeout=wait_phase1)
                     _radio_wake_event.clear()
 
@@ -3117,9 +3138,11 @@ def _hls_radio_worker_thread():
                             except Exception:
                                 pass
 
-                        # Sleep remaining 15 seconds
-                        _radio_wake_event.wait(timeout=min(15.0, track_duration_sec))
-                        _radio_wake_event.clear()
+                        # Sleep remaining seconds until track end
+                        rem_sleep = max(0.0, target_end_sec - time.time())
+                        if rem_sleep > 0:
+                            _radio_wake_event.wait(timeout=rem_sleep)
+                            _radio_wake_event.clear()
 
                     logger.info(f"[RADIO MASTER] Track '{chosen_track.get('title')}' playback completed. Advancing.")
                     _hls_current_track = None
