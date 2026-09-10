@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Form, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import httpx
@@ -661,6 +661,7 @@ async def fetch_attendance_summary(
         final_csrf = cookie_jar.get("_csrf", page_csrf)
 
         logger.info(f"[ATTENDANCE] Fetch loop successful. Refreshed Status: {has_refreshed} in {time.time() - start_time:.3f}s")
+        record_latency("attendance", (time.time() - start_time) * 1000.0, 200)
         return {
             "success": True,
             "session_refreshed": has_refreshed,
@@ -1012,6 +1013,7 @@ async def fetch_timetable(
         final_csrf = cookie_jar.get("_csrf", unquote(csrf_cookie) if csrf_cookie else "")
 
         logger.info(f"[TIMETABLE] Timetable loop complete. Refreshed Status: {has_refreshed} in {time.time() - start_time:.3f}s")
+        record_latency("timetable", (time.time() - start_time) * 1000.0, 200)
         return {
             "success": True,
             "session_refreshed": has_refreshed,
@@ -1129,6 +1131,7 @@ async def fetch_cgpa_summary(
         final_csrf = cookie_jar.get("_csrf", unquote(csrf_cookie) if csrf_cookie else "")
 
         logger.info(f"[CGPA] Successfully structured course array layout. Refreshed: {has_refreshed} in {time.time() - start_time:.3f}s")
+        record_latency("cgpa", (time.time() - start_time) * 1000.0, 200)
         return {
             "success": True,
             "session_refreshed": has_refreshed,
@@ -1239,6 +1242,7 @@ async def fetch_marks_detail(
             scorecard["course_name"] = scorecard["course_desc"]
 
         logger.info(f"[MARKS DETAIL] Scorecard processed in {time.time() - start_time:.3f}s")
+        record_latency("internal_marks", (time.time() - start_time) * 1000.0, 200)
         return {
             "success": True,
             "session_refreshed": has_refreshed,
@@ -1556,6 +1560,8 @@ GAME_TOKEN_TTL = 600  # 10 minutes
 # ------------------ Mongo init (optional, in-memory fallback) ------------------
 _scores_col = None
 _jti_col = None
+_latency_pings_col = None
+_latency_daily_col = None
 
 MONGODB_URI = os.environ.get("MONGODB_URI", "")
 if _pymongo_available and MONGODB_URI:
@@ -1569,6 +1575,8 @@ if _pymongo_available and MONGODB_URI:
         _radio_queue_col = _game_db["radio_queue"]
         _radio_history_col = _game_db["radio_history"]
         _radio_cooldowns_col = _game_db["radio_cooldowns"]
+        _latency_pings_col = _game_db["latency_pings"]
+        _latency_daily_col = _game_db["latency_daily_rollups"]
         # Daily leagues: scores are scoped per (gameId, userId, day, device) —
         # a player's phone best and pc best are separate records, so a score
         # made on one device can never leak into the other league's board.
@@ -1585,7 +1593,14 @@ if _pymongo_available and MONGODB_URI:
         _radio_history_col.create_index("played_at")
         _radio_queue_col.create_index("queue_id", unique=True)
         _radio_cooldowns_col.create_index("user_id", unique=True)
-        logger.info("✅ MongoDB connected — game leaderboard and campus radio persistent.")
+        # 30-day native TTL auto-expiry on raw latency pings (2592000 seconds)
+        try:
+            _latency_pings_col.create_index("timestamp", expireAfterSeconds=2592000)
+            _latency_daily_col.create_index([("date", ASCENDING), ("route", ASCENDING)], unique=True)
+            _latency_daily_col.create_index("route")
+        except Exception as idx_err:
+            logger.debug(f"[LATENCY] Index setup notice: {idx_err}")
+        logger.info("✅ MongoDB connected — game leaderboard, campus radio & latency observatory persistent.")
     except Exception as e:
         logger.error(f"[GAME/RADIO] MongoDB init failed, using in-memory fallback: {e}")
         _scores_col = None
@@ -1594,9 +1609,63 @@ if _pymongo_available and MONGODB_URI:
         _radio_queue_col = None
         _radio_history_col = None
         _radio_cooldowns_col = None
+        _latency_pings_col = None
+        _latency_daily_col = None
 
 _mem_scores = {}  # (gameId, userId, day) -> score int
 _mem_jtis = {}    # jti -> expiry epoch
+_mem_latency_rollups = {}  # (date, route) -> stats dict
+
+def record_latency(route_key: str, latency_ms: float, status_code: int = 200) -> None:
+    """Non-blocking background telemetry logger: saves to MongoDB or in-memory fallback."""
+    def _bg_worker():
+        try:
+            now = datetime.datetime.utcnow()
+            today_str = now.strftime("%Y-%m-%d")
+            lat = round(float(latency_ms), 2)
+
+            if _latency_pings_col is not None and _latency_daily_col is not None:
+                try:
+                    _latency_pings_col.insert_one({
+                        "route": route_key,
+                        "latency_ms": lat,
+                        "status_code": status_code,
+                        "timestamp": now
+                    })
+                except Exception:
+                    pass
+
+                _latency_daily_col.update_one(
+                    {"date": today_str, "route": route_key},
+                    {
+                        "$inc": {"count": 1, "total_latency_ms": lat},
+                        "$min": {"min_latency_ms": lat},
+                        "$max": {"max_latency_ms": lat},
+                        "$set": {"last_updated": now}
+                    },
+                    upsert=True
+                )
+            else:
+                key = (today_str, route_key)
+                if key not in _mem_latency_rollups:
+                    _mem_latency_rollups[key] = {
+                        "count": 1,
+                        "total_latency_ms": lat,
+                        "min_latency_ms": lat,
+                        "max_latency_ms": lat,
+                        "last_updated": now
+                    }
+                else:
+                    item = _mem_latency_rollups[key]
+                    item["count"] += 1
+                    item["total_latency_ms"] += lat
+                    item["min_latency_ms"] = min(item["min_latency_ms"], lat)
+                    item["max_latency_ms"] = max(item["max_latency_ms"], lat)
+                    item["last_updated"] = now
+        except Exception as err:
+            logger.debug(f"[LATENCY] Telemetry record error: {err}")
+
+    threading.Thread(target=_bg_worker, daemon=True).start()
 
 def _game_day() -> str:
     """IST calendar day — the leaderboard resets at midnight IST."""
@@ -3338,5 +3407,851 @@ async def radio_hls_segment(segment_name: str):
             "Access-Control-Allow-Origin": "*",
         }
     )
+
+
+# ============================================================
+# R1 BENCHMARK OBSERVATORY & STATUS WEBSITE
+# ============================================================
+
+_BENCHMARK_ROUTES = [
+    {"key": "timetable", "name": "Timetable", "path": "/fetch-timetable"},
+    {"key": "attendance", "name": "Attendance", "path": "/fetch-attendance"},
+    {"key": "cgpa", "name": "CGPA Ledger", "path": "/fetch-cgpa"},
+    {"key": "internal_marks", "name": "Internal Marks", "path": "/fetch-marks-detail"},
+]
+
+def get_benchmark_stats(time_range: str = "all") -> dict:
+    """Aggregates latency metrics across 4 core routes from MongoDB (or in-memory fallback)."""
+    now = datetime.datetime.utcnow()
+    today_str = now.strftime("%Y-%m-%d")
+    by_route = {}
+
+    if time_range == "24h":
+        if _latency_pings_col is not None:
+            cutoff = now - datetime.timedelta(hours=24)
+            pipeline = [
+                {"$match": {"timestamp": {"$gte": cutoff}}},
+                {"$group": {
+                    "_id": "$route",
+                    "count": {"$sum": 1},
+                    "total_ms": {"$sum": "$latency_ms"},
+                    "min_ms": {"$min": "$latency_ms"},
+                    "max_ms": {"$max": "$latency_ms"},
+                    "last_updated": {"$max": "$timestamp"}
+                }}
+            ]
+            try:
+                results = list(_latency_pings_col.aggregate(pipeline))
+                by_route = {r["_id"]: r for r in results}
+            except Exception as e:
+                logger.debug(f"[LATENCY STATS] 24h ping agg error: {e}")
+        if not by_route and _latency_daily_col is not None:
+            try:
+                results = list(_latency_daily_col.find({"date": today_str}))
+                by_route = {
+                    r["route"]: {
+                        "_id": r["route"],
+                        "count": r.get("count", 0),
+                        "total_ms": r.get("total_latency_ms", 0.0),
+                        "min_ms": r.get("min_latency_ms", 0.0),
+                        "max_ms": r.get("max_latency_ms", 0.0),
+                        "last_updated": r.get("last_updated")
+                    }
+                    for r in results
+                }
+            except Exception:
+                pass
+    else:
+        match_filter = {}
+        if time_range == "10d":
+            start_date = (now.date() - datetime.timedelta(days=9)).strftime("%Y-%m-%d")
+            match_filter = {"date": {"$gte": start_date}}
+        elif time_range == "30d":
+            start_date = (now.date() - datetime.timedelta(days=29)).strftime("%Y-%m-%d")
+            match_filter = {"date": {"$gte": start_date}}
+
+        if _latency_daily_col is not None:
+            pipeline = [
+                {"$match": match_filter},
+                {"$group": {
+                    "_id": "$route",
+                    "count": {"$sum": "$count"},
+                    "total_ms": {"$sum": "$total_latency_ms"},
+                    "min_ms": {"$min": "$min_latency_ms"},
+                    "max_ms": {"$max": "$max_latency_ms"},
+                    "last_updated": {"$max": "$last_updated"}
+                }}
+            ]
+            try:
+                results = list(_latency_daily_col.aggregate(pipeline))
+                by_route = {r["_id"]: r for r in results}
+            except Exception as e:
+                logger.debug(f"[LATENCY STATS] daily agg error: {e}")
+
+    # Fallback to in-memory store if MongoDB returned no rows
+    if not by_route and _mem_latency_rollups:
+        mem_grouped = {}
+        for (d_str, r_key), item in _mem_latency_rollups.items():
+            if time_range == "24h" and d_str != today_str:
+                continue
+            if time_range == "10d":
+                start_d = (now.date() - datetime.timedelta(days=9)).strftime("%Y-%m-%d")
+                if d_str < start_d:
+                    continue
+            if time_range == "30d":
+                start_d = (now.date() - datetime.timedelta(days=29)).strftime("%Y-%m-%d")
+                if d_str < start_d:
+                    continue
+
+            if r_key not in mem_grouped:
+                mem_grouped[r_key] = {
+                    "_id": r_key,
+                    "count": 0,
+                    "total_ms": 0.0,
+                    "min_ms": item["min_latency_ms"],
+                    "max_ms": item["max_latency_ms"],
+                    "last_updated": item["last_updated"]
+                }
+            g = mem_grouped[r_key]
+            g["count"] += item["count"]
+            g["total_ms"] += item["total_latency_ms"]
+            g["min_ms"] = min(g["min_ms"], item["min_latency_ms"])
+            g["max_ms"] = max(g["max_ms"], item["max_latency_ms"])
+            g["last_updated"] = item["last_updated"]
+        by_route = mem_grouped
+
+    route_stats = []
+    total_all_requests = 0
+    total_all_ms = 0.0
+
+    for r in _BENCHMARK_ROUTES:
+        r_key = r["key"]
+        data = by_route.get(r_key, {})
+        cnt = data.get("count", 0)
+        tot = data.get("total_ms", 0.0)
+        min_val = data.get("min_ms", 0.0) if cnt > 0 else 0.0
+        max_val = data.get("max_ms", 0.0) if cnt > 0 else 0.0
+        avg_val = round(tot / cnt, 1) if cnt > 0 else 0.0
+        last_up = data.get("last_updated")
+        if isinstance(last_up, datetime.datetime):
+            last_up_str = last_up.strftime("%Y-%m-%d %H:%M:%S UTC")
+        else:
+            last_up_str = "None"
+
+        total_all_requests += cnt
+        total_all_ms += tot
+
+        route_stats.append({
+            "key": r_key,
+            "name": r["name"],
+            "path": r["path"],
+            "count": cnt,
+            "avg_ms": avg_val,
+            "min_ms": round(min_val, 1),
+            "max_ms": round(max_val, 1),
+            "last_updated": last_up_str
+        })
+
+    overall_avg = round(total_all_ms / total_all_requests, 1) if total_all_requests > 0 else 0.0
+
+    return {
+        "success": True,
+        "time_range": time_range,
+        "total_requests": total_all_requests,
+        "overall_avg_ms": overall_avg,
+        "database": "MongoDB Atlas" if _latency_daily_col is not None else "In-Memory",
+        "routes": route_stats,
+        "server_time": now.strftime("%Y-%m-%d %H:%M:%S UTC")
+    }
+
+@app.get("/api/benchmarks/stats")
+async def api_benchmarks_stats(range: str = "all"):
+    """JSON API endpoint returning live latency statistics and rolling averages."""
+    clean_range = range.lower().strip()
+    if clean_range not in ("24h", "10d", "30d", "all"):
+        clean_range = "all"
+    stats = get_benchmark_stats(clean_range)
+    return JSONResponse(content=stats)
+
+@app.get("/benchmarks", response_class=HTMLResponse)
+@app.get("/benchmarks/", response_class=HTMLResponse)
+@app.get("/status", response_class=HTMLResponse)
+async def benchmarks_website():
+    """Serves the complete retro-terminal benchmark and latency dashboard."""
+    html_content = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TimeTableKL · R1 Benchmark Observatory</title>
+    <style>
+        :root {
+            --bg-color: #F6F4EE;
+            --text-color: #111111;
+            --border-color: #D3CEBE;
+            --pill-bg: #EAE6D9;
+            --bar-color: #0284C7;
+            --bar-accent: #E25C27;
+            --active-tab-bg: #111111;
+            --active-tab-text: #F6F4EE;
+            --grid-line: #E2DDD0;
+            --card-bg: #FFFFFF;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            padding: 24px 20px 60px;
+            max-width: 1180px;
+            margin: 0 auto;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* TABS HEADER */
+        .tabs-nav {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 2px;
+            background-color: var(--border-color);
+            padding: 1px;
+            border: 1px solid var(--border-color);
+            margin-bottom: 28px;
+        }
+
+        .tab-button {
+            background-color: var(--pill-bg);
+            color: #444;
+            border: none;
+            padding: 9px 18px;
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            text-transform: uppercase;
+        }
+
+        .tab-button:hover {
+            background-color: #DFDAC9;
+            color: #000;
+        }
+
+        .tab-button.active {
+            background-color: var(--active-tab-bg);
+            color: var(--active-tab-text);
+        }
+
+        /* HEADER & FILTERS */
+        .main-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            flex-wrap: wrap;
+            gap: 16px;
+            margin-bottom: 12px;
+        }
+
+        .title-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        h1 {
+            font-size: 20px;
+            font-weight: 900;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+
+        .metric-badge {
+            background: #111;
+            color: #fff;
+            padding: 4px 10px;
+            font-size: 11px;
+            font-weight: 700;
+            border-radius: 3px;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .subtitle {
+            font-size: 13px;
+            color: #555;
+            margin-top: 4px;
+        }
+
+        /* FILTER CONTROLS */
+        .range-controls {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+        }
+
+        .range-btn {
+            background: transparent;
+            border: 1px solid #111;
+            color: #111;
+            padding: 5px 12px;
+            font-size: 11px;
+            font-weight: 800;
+            cursor: pointer;
+            text-transform: uppercase;
+            transition: all 0.1s ease;
+        }
+
+        .range-btn.active, .range-btn:hover {
+            background: #111;
+            color: #fff;
+        }
+
+        /* VERDICT BANNER */
+        .verdict-banner {
+            background-color: #111;
+            color: #fff;
+            padding: 16px 20px;
+            border-radius: 4px;
+            margin: 20px 0 32px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        .verdict-text {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .verdict-tag {
+            font-size: 10px;
+            color: #e25c27;
+            font-weight: 800;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        .verdict-message {
+            font-size: 14px;
+            font-weight: 700;
+        }
+
+        .verdict-meta {
+            font-size: 12px;
+            color: #999;
+            text-align: right;
+        }
+
+        /* CHART CONTAINER */
+        .chart-card {
+            background: #FAF8F5;
+            border: 1px solid var(--border-color);
+            padding: 32px 24px 20px;
+            margin-bottom: 32px;
+            position: relative;
+        }
+
+        .legend-row {
+            display: flex;
+            justify-content: flex-end;
+            align-items: center;
+            gap: 16px;
+            margin-bottom: 24px;
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .legend-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+
+        .chart-viewport {
+            height: 360px;
+            position: relative;
+            display: flex;
+            margin-left: 70px;
+            margin-bottom: 40px;
+            border-bottom: 2px solid #333;
+        }
+
+        /* Y-AXIS GRID */
+        .y-axis {
+            position: absolute;
+            left: -70px;
+            top: 0;
+            bottom: 0;
+            width: 60px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            pointer-events: none;
+        }
+
+        .y-label {
+            font-size: 11px;
+            color: #666;
+            text-align: right;
+            line-height: 1;
+        }
+
+        .grid-lines {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: 0;
+            bottom: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            pointer-events: none;
+        }
+
+        .grid-line {
+            width: 100%;
+            height: 1px;
+            border-top: 1px dashed var(--grid-line);
+        }
+
+        /* BARS AREA */
+        .bars-container {
+            position: relative;
+            z-index: 2;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: space-around;
+            align-items: flex-end;
+        }
+
+        .bar-group {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            height: 100%;
+            justify-content: flex-end;
+            width: 120px;
+            position: relative;
+        }
+
+        .bar-fill {
+            width: 44px;
+            background-color: var(--bar-color);
+            transition: height 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+            position: relative;
+            cursor: pointer;
+            border-top: 2px solid #015f91;
+        }
+
+        .bar-fill:hover {
+            opacity: 0.9;
+            filter: brightness(1.1);
+        }
+
+        .bar-value {
+            position: absolute;
+            top: -24px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 11px;
+            font-weight: 800;
+            color: #111;
+            white-space: nowrap;
+        }
+
+        .route-label {
+            position: absolute;
+            bottom: -32px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 12px;
+            font-weight: 700;
+            white-space: nowrap;
+            color: #222;
+        }
+
+        /* CARDS TABLE */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .stat-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            padding: 16px;
+        }
+
+        .stat-card-title {
+            font-size: 11px;
+            color: #666;
+            text-transform: uppercase;
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+
+        .stat-card-value {
+            font-size: 22px;
+            font-weight: 900;
+            color: #111;
+        }
+
+        .stat-card-sub {
+            font-size: 11px;
+            color: #777;
+            margin-top: 4px;
+        }
+
+        /* DATA TABLE */
+        .table-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+            text-align: left;
+        }
+
+        th {
+            background-color: var(--pill-bg);
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-color);
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        td {
+            padding: 12px 16px;
+            border-bottom: 1px solid #ECE7DA;
+            color: #222;
+        }
+
+        tr:hover td {
+            background-color: #FAF8F2;
+        }
+
+        .status-pill {
+            display: inline-block;
+            padding: 3px 8px;
+            font-size: 10px;
+            font-weight: 800;
+            border-radius: 2px;
+            background: #E6F4EA;
+            color: #137333;
+        }
+
+        /* FOOTER */
+        .footer {
+            margin-top: 32px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 11px;
+            color: #777;
+            border-top: 1px solid var(--border-color);
+            padding-top: 16px;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .refresh-btn {
+            background: #111;
+            color: #fff;
+            border: none;
+            padding: 6px 12px;
+            font-size: 11px;
+            font-weight: 700;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- NAVIGATION TABS -->
+    <div class="tabs-nav">
+        <button class="tab-button" onclick="selectTab(1)">[01] TIMETABLE GRAPH</button>
+        <button class="tab-button" onclick="selectTab(2)">[02] ATTENDANCE GRAPH</button>
+        <button class="tab-button" onclick="selectTab(3)">[03] CGPA GRAPH</button>
+        <button class="tab-button active" onclick="selectTab(4)">[04] ALL-ROUTES SPECTRUM</button>
+        <button class="tab-button" onclick="selectTab(5)">[05] PEAK CONCURRENCY (RPS)</button>
+    </div>
+
+    <!-- MAIN HEADER -->
+    <div class="main-header">
+        <div>
+            <div class="title-row">
+                <h1 id="view-title">ALL-ROUTES LATENCY SPECTRUM (SINGLE REQUEST)</h1>
+                <span class="metric-badge">&darr; LOWER IS BETTER (MS)</span>
+            </div>
+            <div class="subtitle" id="view-subtitle">Continuous live latency telemetry · Real student traffic via EC2 & KL ERP</div>
+        </div>
+
+        <div class="range-controls">
+            <button class="range-btn" onclick="setRange('24h')">LAST 24H</button>
+            <button class="range-btn" onclick="setRange('10d')">LAST 10 DAYS</button>
+            <button class="range-btn" onclick="setRange('30d')">LAST 30 DAYS</button>
+            <button class="range-btn active" onclick="setRange('all')">ALL TIME</button>
+        </div>
+    </div>
+
+    <!-- VERDICT BANNER -->
+    <div class="verdict-banner">
+        <div class="verdict-text">
+            <div class="verdict-tag">VERDICT // LOWER IS BETTER (ms)</div>
+            <div class="verdict-message" id="verdict-msg">R1 Telemetry Engine — Live continuous sample averages over 4 core routes</div>
+        </div>
+        <div class="verdict-meta" id="verdict-meta">
+            Database: Connecting...<br>
+            Updated: Just now
+        </div>
+    </div>
+
+    <!-- SUMMARY CARDS -->
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-card-title">Total Requests Sampled</div>
+            <div class="stat-card-value" id="card-total-req">0</div>
+            <div class="stat-card-sub" id="card-total-sub">Across 4 monitored routes</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-card-title">Average Latency (Running Avg)</div>
+            <div class="stat-card-value" id="card-avg-latency">0 ms</div>
+            <div class="stat-card-sub">Weighted across all sampled pings</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-card-title">Fastest Recorded Route</div>
+            <div class="stat-card-value" id="card-fastest">--</div>
+            <div class="stat-card-sub" id="card-fastest-sub">Sub-second execution</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-card-title">Persistence & TTL Retention</div>
+            <div class="stat-card-value" id="card-db-mode">MongoDB Atlas</div>
+            <div class="stat-card-sub">30-day raw TTL + daily rollups</div>
+        </div>
+    </div>
+
+    <!-- CHART CARD -->
+    <div class="chart-card">
+        <div class="legend-row">
+            <div class="legend-item">
+                <div class="legend-dot" style="background-color: var(--bar-color);"></div>
+                <span>TimeTableKL Live (Real Endpoints)</span>
+            </div>
+            <div class="legend-item">
+                <span id="sample-indicator" style="color: #666;">Sampled: 0 requests</span>
+            </div>
+        </div>
+
+        <div class="chart-viewport">
+            <!-- Y-Axis Scale (0 to 7000 ms) -->
+            <div class="y-axis">
+                <div class="y-label">7000 ms</div>
+                <div class="y-label">5250 ms</div>
+                <div class="y-label">3500 ms</div>
+                <div class="y-label">1750 ms</div>
+                <div class="y-label">0 ms</div>
+            </div>
+
+            <!-- Horizontal Dashed Grid Lines -->
+            <div class="grid-lines">
+                <div class="grid-line"></div>
+                <div class="grid-line"></div>
+                <div class="grid-line"></div>
+                <div class="grid-line"></div>
+                <div class="grid-line" style="border-top: none;"></div>
+            </div>
+
+            <!-- Interactive Bars -->
+            <div class="bars-container" id="bars-container">
+                <!-- Injected via JavaScript -->
+            </div>
+        </div>
+    </div>
+
+    <!-- DETAILED ROUTES TABLE -->
+    <div class="table-card">
+        <table>
+            <thead>
+                <tr>
+                    <th>Route Key</th>
+                    <th>Endpoint Path</th>
+                    <th>Total Requests (N)</th>
+                    <th>Average Latency</th>
+                    <th>Min / Max Latency</th>
+                    <th>Last Sampled</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody id="routes-tbody">
+                <!-- Injected via JavaScript -->
+            </tbody>
+        </table>
+    </div>
+
+    <!-- FOOTER -->
+    <div class="footer">
+        <div>
+            TimeTableKL R1 Observability · AWS API Gateway Rotator Protected · Decoupled Cloud Storage
+        </div>
+        <div style="display: flex; align-items: center; gap: 12px;">
+            <span id="auto-refresh-label">Auto-refresh in 10s</span>
+            <button class="refresh-btn" onclick="fetchStats()">SYNC NOW</button>
+        </div>
+    </div>
+
+    <script>
+        let currentRange = 'all';
+        let countdown = 10;
+        const MAX_Y_MS = 7000;
+
+        function setRange(range) {
+            currentRange = range;
+            document.querySelectorAll('.range-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.textContent.toLowerCase().includes(range));
+            });
+            fetchStats();
+        }
+
+        function selectTab(idx) {
+            document.querySelectorAll('.tab-button').forEach((btn, i) => {
+                btn.classList.toggle('active', i === idx - 1);
+            });
+            const titles = {
+                1: "TIMETABLE ROUTE LATENCY GRAPH",
+                2: "ATTENDANCE ROUTE LATENCY GRAPH",
+                3: "CGPA LEDGER ROUTE LATENCY GRAPH",
+                4: "ALL-ROUTES LATENCY SPECTRUM (SINGLE REQUEST)",
+                5: "PEAK CONCURRENCY & RPS ESTIMATION"
+            };
+            document.getElementById('view-title').textContent = titles[idx] || titles[4];
+            fetchStats();
+        }
+
+        async function fetchStats() {
+            try {
+                countdown = 10;
+                const res = await fetch('/api/benchmarks/stats?range=' + currentRange);
+                const data = await res.json();
+                renderUI(data);
+            } catch (err) {
+                console.error("Failed to fetch benchmark stats:", err);
+            }
+        }
+
+        function renderUI(data) {
+            // Update Summary Cards
+            document.getElementById('card-total-req').textContent = data.total_requests.toLocaleString();
+            document.getElementById('card-avg-latency').textContent = (data.overall_avg_ms || 0) + ' ms';
+            document.getElementById('card-db-mode').textContent = data.database || 'MongoDB Atlas';
+            document.getElementById('sample-indicator').textContent = 'Sampled: ' + data.total_requests.toLocaleString() + ' requests';
+
+            document.getElementById('verdict-meta').innerHTML = 
+                'Storage: ' + data.database + '<br>' +
+                'Updated: ' + (data.server_time || 'Just now');
+
+            let fastest = null;
+            let fastestMs = Infinity;
+
+            const barsContainer = document.getElementById('bars-container');
+            const tbody = document.getElementById('routes-tbody');
+            barsContainer.innerHTML = '';
+            tbody.innerHTML = '';
+
+            data.routes.forEach(r => {
+                if (r.count > 0 && r.avg_ms < fastestMs) {
+                    fastestMs = r.avg_ms;
+                    fastest = r.name;
+                }
+
+                // Render Bar
+                const group = document.createElement('div');
+                group.className = 'bar-group';
+
+                const barFill = document.createElement('div');
+                barFill.className = 'bar-fill';
+                
+                // Height calculation relative to MAX_Y_MS (7000ms)
+                const clampedMs = Math.min(r.avg_ms, MAX_Y_MS);
+                const heightPercent = r.count > 0 ? Math.max((clampedMs / MAX_Y_MS) * 100, 3) : 2;
+                barFill.style.height = heightPercent + '%';
+
+                const barVal = document.createElement('div');
+                barVal.className = 'bar-value';
+                barVal.textContent = r.count > 0 ? (r.avg_ms + ' ms') : '0 ms';
+
+                const routeLabel = document.createElement('div');
+                routeLabel.className = 'route-label';
+                routeLabel.textContent = r.name;
+
+                barFill.appendChild(barVal);
+                group.appendChild(barFill);
+                group.appendChild(routeLabel);
+                barsContainer.appendChild(group);
+
+                // Render Table Row
+                const tr = document.createElement('tr');
+                tr.innerHTML = 
+                    '<td><strong>' + r.key + '</strong></td>' +
+                    '<td><code>' + r.path + '</code></td>' +
+                    '<td>' + r.count.toLocaleString() + '</td>' +
+                    '<td><strong>' + (r.count > 0 ? r.avg_ms + ' ms' : '--') + '</strong></td>' +
+                    '<td>' + (r.count > 0 ? (r.min_ms + ' ms / ' + r.max_ms + ' ms') : '--') + '</td>' +
+                    '<td>' + r.last_updated + '</td>' +
+                    '<td><span class="status-pill">' + (r.count > 0 ? 'ACTIVE' : 'IDLE') + '</span></td>';
+                tbody.appendChild(tr);
+            });
+
+            if (fastest) {
+                document.getElementById('card-fastest').textContent = fastest;
+                document.getElementById('card-fastest-sub').textContent = fastestMs + ' ms avg latency';
+                document.getElementById('verdict-msg').textContent = 
+                    'Fastest live route: ' + fastest + ' (' + fastestMs + ' ms) · Total ' + data.total_requests.toLocaleString() + ' requests tracked';
+            } else {
+                document.getElementById('card-fastest').textContent = 'Awaiting pings';
+                document.getElementById('card-fastest-sub').textContent = 'Send requests to generate stats';
+            }
+        }
+
+        // Auto-refresh ticker
+        setInterval(() => {
+            countdown--;
+            document.getElementById('auto-refresh-label').textContent = 'Auto-refresh in ' + countdown + 's';
+            if (countdown <= 0) {
+                fetchStats();
+            }
+        }, 1000);
+
+        fetchStats();
+    </script>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html_content)
+
 
 
