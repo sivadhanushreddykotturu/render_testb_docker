@@ -478,9 +478,97 @@ def build_register_url(base_url: str, href: str) -> str | None:
         logger.error(f"[REGISTER_URL] Reconstruct error: {e}")
         return None
 
+# ------------------ SINGLE-FLIGHT COALESCING & 30s RAM CACHE ------------------
+class SingleFlightCache:
+    """Zero-overhead in-memory SingleFlight request coalescing and RAM cache.
+    - If identical requests arrive concurrently, only 1 request hits the university ERP;
+      all other callers await the leader and share the result.
+    - Successful responses are cached for ttl_seconds (default 30s).
+    - Cache hits resolve in < 1ms and log sub-millisecond telemetry.
+    - Protects the university portal & AWS Gateways from DoS and spam loops without
+      affecting legitimate users.
+    """
+    def __init__(self, ttl_seconds: float = 30.0):
+        self.ttl = ttl_seconds
+        self._cache: dict = {}      # key -> (expiry_monotonic, data_dict)
+        self._inflight: dict = {}   # key -> asyncio.Task
+        self._lock = asyncio.Lock()
+
+    def _cleanup_inflight(self, key: tuple):
+        self._inflight.pop(key, None)
+
+    async def execute(self, key: tuple, coro_func, route_name: str, start_time: float):
+        now = time.monotonic()
+
+        # 1. Fast path: Check RAM cache
+        cached = self._cache.get(key)
+        if cached is not None:
+            expiry, data = cached
+            if now < expiry:
+                hit_latency = (time.time() - start_time) * 1000.0
+                record_latency(route_name, hit_latency, 200)
+                student_id = key[1] if len(key) > 1 else "unknown"
+                logger.info(f"[{route_name.upper()}] Cache hit for {student_id} ({hit_latency:.2f}ms)")
+                return data.copy()
+
+        # 2. Check or create SingleFlight task
+        leader = False
+        async with self._lock:
+            task = self._inflight.get(key)
+            if task is None:
+                task = asyncio.create_task(coro_func())
+                self._inflight[key] = task
+                task.add_done_callback(lambda _: self._cleanup_inflight(key))
+                leader = True
+
+        student_id = key[1] if len(key) > 1 else "unknown"
+        if not leader:
+            logger.info(f"[{route_name.upper()}] Coalescing concurrent request for {student_id} via SingleFlight")
+
+        result = await asyncio.shield(task)
+        if leader and isinstance(result, dict) and result.get("success"):
+            self._cache[key] = (time.monotonic() + self.ttl, result)
+            self._prune_expired()
+        return result.copy() if isinstance(result, dict) else result
+
+    def _prune_expired(self):
+        if len(self._cache) > 2000:
+            now = time.monotonic()
+            expired = [k for k, (exp, _) in self._cache.items() if now >= exp]
+            for k in expired:
+                self._cache.pop(k, None)
+
+    def clear(self):
+        self._cache.clear()
+        self._inflight.clear()
+
+erp_cache = SingleFlightCache(ttl_seconds=30.0)
+
+def single_flight_cached(route_name: str, key_builder, ttl_seconds: float = 30.0):
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            start_time = time.time()
+            try:
+                cache_key = key_builder(kwargs)
+            except Exception:
+                return await func(*args, **kwargs)
+            return await erp_cache.execute(cache_key, lambda: func(*args, **kwargs), route_name, start_time)
+        return wrapper
+    return decorator
+
+
 # ------------------ LOGIN ENDPOINT ------------------
 @app.post("/login")
 @with_gateway_retries(max_retries=3)
+@single_flight_cached(
+    route_name="login",
+    key_builder=lambda kwargs: (
+        "login",
+        kwargs.get("username", "").strip(),
+        hashlib.sha256(kwargs.get("password", "").encode("utf-8")).hexdigest()[:16]
+    )
+)
 async def login(username: str = Form(...), password: str = Form(...)):
     try:
         async with make_erp_client() as client:
@@ -524,6 +612,15 @@ async def login(username: str = Form(...), password: str = Form(...)):
 # ------------------ FETCH ATTENDANCE ------------------
 @app.post("/fetch-attendance")
 @with_gateway_retries(max_retries=3)
+@single_flight_cached(
+    route_name="attendance",
+    key_builder=lambda kwargs: (
+        "attendance",
+        kwargs.get("username", "").strip(),
+        str(kwargs.get("academic_year_code", "")).strip(),
+        str(kwargs.get("semester_id", "")).strip()
+    )
+)
 async def fetch_attendance_summary(
     username: str = Form(...),
     password: str = Form(...),
@@ -926,6 +1023,15 @@ async def fetch_seating_plan(
 # ------------------ FETCH TIMETABLE ------------------
 @app.post("/fetch-timetable")
 @with_gateway_retries(max_retries=3)
+@single_flight_cached(
+    route_name="timetable",
+    key_builder=lambda kwargs: (
+        "timetable",
+        kwargs.get("username", "").strip(),
+        str(kwargs.get("academic_year_code", "19")).strip(),
+        str(kwargs.get("semester_id", "1")).strip()
+    )
+)
 async def fetch_timetable(
     username: str = Form(...),
     password: str = Form(...),
@@ -1040,6 +1146,13 @@ async def fetch_timetable(
 
 @app.post("/fetch-cgpa")
 @with_gateway_retries(max_retries=3)
+@single_flight_cached(
+    route_name="cgpa",
+    key_builder=lambda kwargs: (
+        "cgpa",
+        kwargs.get("username", "").strip()
+    )
+)
 async def fetch_cgpa_summary(
     username: str = Form(...),
     password: str = Form(...),
@@ -1159,6 +1272,14 @@ async def fetch_cgpa_summary(
 
 @app.post("/fetch-marks-detail")
 @with_gateway_retries(max_retries=3)
+@single_flight_cached(
+    route_name="internal_marks",
+    key_builder=lambda kwargs: (
+        "internal_marks",
+        kwargs.get("username", "").strip(),
+        str(kwargs.get("target_href", "")).strip()
+    )
+)
 async def fetch_marks_detail(
     target_href: str = Form(...),
     username: str = Form(...),
