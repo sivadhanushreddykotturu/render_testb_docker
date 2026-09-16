@@ -328,6 +328,25 @@ def health():
         },
     }
 
+# ------------------ DATA FLYWHEEL STATS ------------------
+@app.get("/flywheel-stats")
+def get_flywheel_stats():
+    """Secure endpoint to check how many CAPTCHAs have been collected.
+    Returns only the total count to protect privacy and dataset security."""
+    try:
+        with sqlite3.connect(DB_PATH, timeout=5.0) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM captchas")
+            count = cursor.fetchone()[0]
+        return {
+            "success": True,
+            "total_collected": count,
+            "message": "Data Flywheel is actively deduplicating and collecting."
+        }
+    except Exception as e:
+        logger.error(f"[FLYWHEEL] Stats endpoint error: {e}")
+        return JSONResponse(status_code=500, content={"success": False, "detail": "Stats unavailable at the moment."})
+
 # ------------------ UTILS ------------------
 def is_login_failed(response: httpx.Response) -> bool:
     url_str = str(response.url)
