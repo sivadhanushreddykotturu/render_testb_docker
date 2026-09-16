@@ -19,5 +19,6 @@ services:
     restart: unless-stopped
     volumes:
       - ./logs:/app/logs
+      - ./dataset:/app/dataset
     depends_on:
       - bgutil-provider

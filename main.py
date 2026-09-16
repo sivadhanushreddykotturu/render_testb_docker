@@ -27,6 +27,28 @@ import secrets
 import datetime
 import functools
 from bs4 import BeautifulSoup
+import sqlite3
+
+# ------------------ DATA FLYWHEEL INIT ------------------
+DATASET_DIR = "dataset"
+IMAGES_DIR = os.path.join(DATASET_DIR, "images")
+DB_PATH = os.path.join(DATASET_DIR, "captchas.db")
+
+os.makedirs(IMAGES_DIR, exist_ok=True)
+
+try:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS captchas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                image_hash TEXT UNIQUE,
+                text_label TEXT,
+                filename TEXT,
+                created_at DATETIME
+            )
+        """)
+except Exception as e:
+    pass  # Rely on basic logging below if needed, or silently continue if DB init fails locally
 
 from requests_ip_rotator import ApiGateway
 from gateway_proxy import ApiGatewayTransport, GatewayUnavailableError
@@ -457,6 +479,28 @@ async def auto_login(client: httpx.AsyncClient, username: str, password: str, se
         client, "POST", login_url, step_cookies, data=payload, headers=local_headers
     )
     response.raise_for_status()
+
+    # --- DATA FLYWHEEL LOGIC ---
+    if not is_login_failed(response):
+        try:
+            img_hash = hashlib.md5(captcha_response.content).hexdigest()
+            filename = f"{captcha_text}_{img_hash}.png"
+            timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            
+            with sqlite3.connect(DB_PATH, timeout=5.0) as conn:
+                conn.execute(
+                    "INSERT INTO captchas (image_hash, text_label, filename, created_at) VALUES (?, ?, ?, ?)",
+                    (img_hash, captcha_text, filename, timestamp)
+                )
+            
+            with open(os.path.join(IMAGES_DIR, filename), "wb") as f:
+                f.write(captcha_response.content)
+            logger.info(f"[FLYWHEEL] Saved new verified captcha: {filename}")
+        except sqlite3.IntegrityError:
+            pass  # Duplicate hash, silently ignore
+        except Exception as e:
+            logger.error(f"[FLYWHEEL] Error saving dataset: {e}")
+    # ---------------------------
 
     for key in ("kl_erp_device_id", "SERVERID"):
         if key not in final_cookies and key in seed_cookies:
