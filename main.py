@@ -870,24 +870,31 @@ async def fetch_register_details(
     }
 
     try:
-        # Register detail URLs contain encrypted binary parameters with non-UTF-8 bytes 
-        # (e.g. %F5%B6%EA%9F...) which AWS API Gateway REST APIs parse, re-encode and corrupt, 
+        # Register detail URLs contain encrypted binary parameters with non-UTF-8 bytes
+        # (e.g. %F5%B6%EA%9F...) which AWS API Gateway REST APIs parse, re-encode and corrupt,
         # resulting in HTTP 400 Bad Request. We request directly from the host.
+        #
+        # IMPORTANT: login AND the register fetch must use the same client (same host IP)
+        # because the ERP binds PHPSESSID to the originating IP. If login goes through API
+        # Gateway (a different IP) and the fetch goes direct, the ERP sees an IP mismatch
+        # and immediately redirects back to site/login with a 302.
         async with httpx.AsyncClient(
             verify=False, headers=DEFAULT_HEADERS, http2=True,
             event_hooks={"response": [log_rate_limit]}
         ) as client:
             if not php_sess_id or not csrf_cookie:
                 logger.info(f"[LAZY-REGISTER] Cold-start auto-login for {username}")
-                async with make_erp_client() as gw_client:
-                    for attempt in range(3):
-                        if attempt > 0:
-                            await asyncio.sleep(random.uniform(1.0, 2.0))
-                        login_response, cookie_jar = await auto_login(gw_client, username, password, seed_cookies={})
-                        if not is_login_failed(login_response):
-                            break
-                    else:
-                        raise HTTPException(status_code=401, detail="Cold-start login failed. Check credentials.")
+                for attempt in range(3):
+                    if attempt > 0:
+                        # Longer backoff on 429 — host IP rate-limit window is typically 10–60s
+                        sleep_time = random.uniform(3.0, 6.0)
+                        logger.info(f"[LAZY-REGISTER] Backoff {sleep_time:.1f}s before retry {attempt+1}...")
+                        await asyncio.sleep(sleep_time)
+                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies={})
+                    if not is_login_failed(login_response):
+                        break
+                else:
+                    raise HTTPException(status_code=401, detail="Cold-start login failed. Check credentials.")
                 active_csrf = extract_csrf(login_response.text)
                 php_sess_id = cookie_jar.get("PHPSESSID", "")
             else:
@@ -898,15 +905,16 @@ async def fetch_register_details(
 
             if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
                 logger.warning("[LAZY-REGISTER] Session invalid or redirected (302). Auto-healing context stream...")
-                async with make_erp_client() as gw_client:
-                    for attempt in range(3):
-                        if attempt > 0:
-                            await asyncio.sleep(random.uniform(1.0, 2.0))
-                        login_response, cookie_jar = await auto_login(gw_client, username, password, seed_cookies=cookie_jar)
-                        if not is_login_failed(login_response):
-                            break
-                    else:
-                        raise HTTPException(status_code=401, detail="Authentication credentials expired.")
+                for attempt in range(3):
+                    if attempt > 0:
+                        sleep_time = random.uniform(3.0, 6.0)
+                        logger.info(f"[LAZY-REGISTER] Backoff {sleep_time:.1f}s before heal retry {attempt+1}...")
+                        await asyncio.sleep(sleep_time)
+                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
+                    if not is_login_failed(login_response):
+                        break
+                else:
+                    raise HTTPException(status_code=401, detail="Authentication credentials expired.")
 
                 active_csrf = extract_csrf(login_response.text) or cookie_jar.get("_csrf", "")
                 register_url_with_csrf = f"{register_url}&_csrf={active_csrf}"
@@ -914,6 +922,7 @@ async def fetch_register_details(
 
             response.raise_for_status()
             html_text = response.text
+
 
         try:
             soup = BeautifulSoup(html_text, "lxml")
