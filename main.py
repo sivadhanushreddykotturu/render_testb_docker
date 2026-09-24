@@ -870,61 +870,65 @@ async def fetch_register_details(
     }
 
     try:
-        # Register detail URLs contain encrypted binary parameters with non-UTF-8 bytes
-        # (e.g. %F5%B6%EA%9F...) which AWS API Gateway REST APIs parse, re-encode and corrupt,
-        # resulting in HTTP 400 Bad Request for a random-endpoint gateway client.
+        # TWO-CLIENT STRATEGY:
+        # 1. Login goes through AWS API Gateway → protects host IP from 429 rate limiting
+        # 2. Register fetch goes direct → avoids gateway corrupting binary params (%F5%B6...)
         #
-        # Solution: LockedEndpointTransport pins every request in this flow to ONE specific
-        # gateway endpoint chosen upfront. This means login AND the register fetch both come
-        # from the same single AWS egress IP, satisfying the ERP's PHPSESSID IP-binding check
-        # while keeping our host IP completely protected from login rate limits.
-        endpoints = get_gateway_endpoints()
-        if not endpoints:
-            raise GatewayUnavailableError("No API Gateway endpoints available.")
-        locked_endpoint = random.choice(endpoints)
-        logger.info(f"[LAZY-REGISTER] Locked to gateway endpoint: {locked_endpoint}")
+        # ERP sessions are NOT IP-bound (confirmed: phone sessions survive network switches).
+        # The earlier 302 was caused by SERVERID (sticky-session) not being captured from
+        # the gateway login response, causing the load balancer to route the fetch to a
+        # different backend server that didn't have the session. We now explicitly default
+        # SERVERID to "erp1" if the gateway response didn't return one.
 
-        async with httpx.AsyncClient(
-            headers=DEFAULT_HEADERS,
-            transport=LockedEndpointTransport(locked_endpoint, http2=True),
-            event_hooks={"response": [log_rate_limit]},
-            timeout=30.0,
-        ) as client:
-            if not php_sess_id or not csrf_cookie:
-                logger.info(f"[LAZY-REGISTER] Cold-start auto-login for {username}")
+        if not php_sess_id or not csrf_cookie:
+            logger.info(f"[LAZY-REGISTER] Cold-start auto-login via gateway for {username}")
+            async with make_erp_client() as gw_client:
                 for attempt in range(3):
                     if attempt > 0:
                         await asyncio.sleep(random.uniform(1.0, 2.0))
-                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies={})
+                    login_response, cookie_jar = await auto_login(gw_client, username, password, seed_cookies={})
                     if not is_login_failed(login_response):
                         break
                 else:
                     raise HTTPException(status_code=401, detail="Cold-start login failed. Check credentials.")
-                active_csrf = extract_csrf(login_response.text)
-                php_sess_id = cookie_jar.get("PHPSESSID", "")
-            else:
-                active_csrf = unquote(csrf_cookie)
+            active_csrf = extract_csrf(login_response.text)
+            php_sess_id = cookie_jar.get("PHPSESSID", "")
+            # Ensure SERVERID is set — if gateway didn't return one, default to erp1
+            # so the load balancer routes the fetch to the correct sticky backend server.
+            if not cookie_jar.get("SERVERID"):
+                cookie_jar["SERVERID"] = "erp1"
+        else:
+            active_csrf = unquote(csrf_cookie)
 
+        # Register fetch goes direct — gateway corrupts binary params in the URL
+        async with httpx.AsyncClient(
+            verify=False, headers=DEFAULT_HEADERS, http2=True,
+            event_hooks={"response": [log_rate_limit]}
+        ) as direct_client:
             register_url_with_csrf = f"{register_url}&_csrf={active_csrf}"
-            response = await client.get(register_url_with_csrf, cookies=cookie_jar, timeout=15)
+            response = await direct_client.get(register_url_with_csrf, cookies=cookie_jar, timeout=15)
 
             if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
-                logger.warning("[LAZY-REGISTER] Session invalid or redirected (302). Auto-healing context stream...")
-                for attempt in range(3):
-                    if attempt > 0:
-                        await asyncio.sleep(random.uniform(1.0, 2.0))
-                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
-                    if not is_login_failed(login_response):
-                        break
-                else:
-                    raise HTTPException(status_code=401, detail="Authentication credentials expired.")
+                logger.warning("[LAZY-REGISTER] Session invalid. Auto-healing via gateway...")
+                async with make_erp_client() as gw_client:
+                    for attempt in range(3):
+                        if attempt > 0:
+                            await asyncio.sleep(random.uniform(1.0, 2.0))
+                        login_response, cookie_jar = await auto_login(gw_client, username, password, seed_cookies=cookie_jar)
+                        if not is_login_failed(login_response):
+                            break
+                    else:
+                        raise HTTPException(status_code=401, detail="Authentication credentials expired.")
 
+                if not cookie_jar.get("SERVERID"):
+                    cookie_jar["SERVERID"] = "erp1"
                 active_csrf = extract_csrf(login_response.text) or cookie_jar.get("_csrf", "")
                 register_url_with_csrf = f"{register_url}&_csrf={active_csrf}"
-                response = await client.get(register_url_with_csrf, cookies=cookie_jar, timeout=15)
+                response = await direct_client.get(register_url_with_csrf, cookies=cookie_jar, timeout=15)
 
             response.raise_for_status()
             html_text = response.text
+
 
 
 
@@ -1381,38 +1385,31 @@ async def fetch_marks_detail(
         full_detail_url = f"{BASE_URL}/{target_href.lstrip('/')}"
 
     try:
-        # Marks detail URLs contain encrypted binary parameters with non-UTF-8 bytes
-        # (e.g. %F5%B6%EA%9F...) which AWS API Gateway REST APIs parse, re-encode and corrupt,
-        # resulting in HTTP 400 Bad Request for a random-endpoint gateway client.
-        #
-        # Solution: LockedEndpointTransport pins this entire flow to ONE gateway endpoint so
-        # login and the subsequent fetch originate from the same AWS egress IP.
-        endpoints = get_gateway_endpoints()
-        if not endpoints:
-            raise GatewayUnavailableError("No API Gateway endpoints available.")
-        locked_endpoint = random.choice(endpoints)
-        logger.info(f"[MARKS DETAIL] Locked to gateway endpoint: {locked_endpoint}")
-
+        # TWO-CLIENT STRATEGY (same as fetch-register-detail):
+        # 1. Login via gateway → protects host IP from 429
+        # 2. Fetch via direct client → avoids 400 from binary param corruption
+        # SERVERID explicitly defaulted to "erp1" if gateway doesn't return it.
         async with httpx.AsyncClient(
-            headers=DEFAULT_HEADERS,
-            transport=LockedEndpointTransport(locked_endpoint, http2=True),
-            event_hooks={"response": [log_rate_limit]},
-            timeout=30.0,
-        ) as client:
-            response = await client.get(full_detail_url, cookies=cookie_jar, timeout=15)
+            verify=False, headers=DEFAULT_HEADERS, http2=True,
+            event_hooks={"response": [log_rate_limit]}
+        ) as direct_client:
+            response = await direct_client.get(full_detail_url, cookies=cookie_jar, timeout=15)
 
             if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
-                logger.warning("[MARKS DETAIL] Token expired. Launching auto-login fallback...")
-                for attempt in range(3):
-                    if attempt > 0:
-                        await asyncio.sleep(random.uniform(1.0, 2.0))
-                    res, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
-                    if not is_login_failed(res):
-                        break
-                else:
-                    raise HTTPException(status_code=401, detail="Session verification recovery rejected.")
+                logger.warning("[MARKS DETAIL] Token expired. Launching auto-login fallback via gateway...")
+                async with make_erp_client() as gw_client:
+                    for attempt in range(3):
+                        if attempt > 0:
+                            await asyncio.sleep(random.uniform(1.0, 2.0))
+                        res, cookie_jar = await auto_login(gw_client, username, password, seed_cookies=cookie_jar)
+                        if not is_login_failed(res):
+                            break
+                    else:
+                        raise HTTPException(status_code=401, detail="Session verification recovery rejected.")
 
-                response = await client.get(full_detail_url, cookies=cookie_jar, timeout=15)
+                if not cookie_jar.get("SERVERID"):
+                    cookie_jar["SERVERID"] = "erp1"
+                response = await direct_client.get(full_detail_url, cookies=cookie_jar, timeout=15)
 
             response.raise_for_status()
             html_content = response.text
