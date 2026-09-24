@@ -51,7 +51,7 @@ except Exception as e:
     pass  # Rely on basic logging below if needed, or silently continue if DB init fails locally
 
 from requests_ip_rotator import ApiGateway
-from gateway_proxy import ApiGatewayTransport, GatewayUnavailableError
+from gateway_proxy import ApiGatewayTransport, GatewayUnavailableError, LockedEndpointTransport
 
 
 class GatewayRequestError(Exception):
@@ -872,24 +872,29 @@ async def fetch_register_details(
     try:
         # Register detail URLs contain encrypted binary parameters with non-UTF-8 bytes
         # (e.g. %F5%B6%EA%9F...) which AWS API Gateway REST APIs parse, re-encode and corrupt,
-        # resulting in HTTP 400 Bad Request. We request directly from the host.
+        # resulting in HTTP 400 Bad Request for a random-endpoint gateway client.
         #
-        # IMPORTANT: login AND the register fetch must use the same client (same host IP)
-        # because the ERP binds PHPSESSID to the originating IP. If login goes through API
-        # Gateway (a different IP) and the fetch goes direct, the ERP sees an IP mismatch
-        # and immediately redirects back to site/login with a 302.
+        # Solution: LockedEndpointTransport pins every request in this flow to ONE specific
+        # gateway endpoint chosen upfront. This means login AND the register fetch both come
+        # from the same single AWS egress IP, satisfying the ERP's PHPSESSID IP-binding check
+        # while keeping our host IP completely protected from login rate limits.
+        endpoints = get_gateway_endpoints()
+        if not endpoints:
+            raise GatewayUnavailableError("No API Gateway endpoints available.")
+        locked_endpoint = random.choice(endpoints)
+        logger.info(f"[LAZY-REGISTER] Locked to gateway endpoint: {locked_endpoint}")
+
         async with httpx.AsyncClient(
-            verify=False, headers=DEFAULT_HEADERS, http2=True,
-            event_hooks={"response": [log_rate_limit]}
+            headers=DEFAULT_HEADERS,
+            transport=LockedEndpointTransport(locked_endpoint, http2=True),
+            event_hooks={"response": [log_rate_limit]},
+            timeout=30.0,
         ) as client:
             if not php_sess_id or not csrf_cookie:
                 logger.info(f"[LAZY-REGISTER] Cold-start auto-login for {username}")
                 for attempt in range(3):
                     if attempt > 0:
-                        # Longer backoff on 429 — host IP rate-limit window is typically 10–60s
-                        sleep_time = random.uniform(3.0, 6.0)
-                        logger.info(f"[LAZY-REGISTER] Backoff {sleep_time:.1f}s before retry {attempt+1}...")
-                        await asyncio.sleep(sleep_time)
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
                     login_response, cookie_jar = await auto_login(client, username, password, seed_cookies={})
                     if not is_login_failed(login_response):
                         break
@@ -907,9 +912,7 @@ async def fetch_register_details(
                 logger.warning("[LAZY-REGISTER] Session invalid or redirected (302). Auto-healing context stream...")
                 for attempt in range(3):
                     if attempt > 0:
-                        sleep_time = random.uniform(3.0, 6.0)
-                        logger.info(f"[LAZY-REGISTER] Backoff {sleep_time:.1f}s before heal retry {attempt+1}...")
-                        await asyncio.sleep(sleep_time)
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
                     login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
                     if not is_login_failed(login_response):
                         break
@@ -922,6 +925,7 @@ async def fetch_register_details(
 
             response.raise_for_status()
             html_text = response.text
+
 
 
         try:
@@ -1377,26 +1381,36 @@ async def fetch_marks_detail(
         full_detail_url = f"{BASE_URL}/{target_href.lstrip('/')}"
 
     try:
-        # Marks detail URLs contain encrypted binary parameters with non-UTF-8 bytes 
-        # (e.g. %F5%B6%EA%9F...) which AWS API Gateway REST APIs parse, re-encode and corrupt, 
-        # resulting in HTTP 400 Bad Request. We request directly from the host.
+        # Marks detail URLs contain encrypted binary parameters with non-UTF-8 bytes
+        # (e.g. %F5%B6%EA%9F...) which AWS API Gateway REST APIs parse, re-encode and corrupt,
+        # resulting in HTTP 400 Bad Request for a random-endpoint gateway client.
+        #
+        # Solution: LockedEndpointTransport pins this entire flow to ONE gateway endpoint so
+        # login and the subsequent fetch originate from the same AWS egress IP.
+        endpoints = get_gateway_endpoints()
+        if not endpoints:
+            raise GatewayUnavailableError("No API Gateway endpoints available.")
+        locked_endpoint = random.choice(endpoints)
+        logger.info(f"[MARKS DETAIL] Locked to gateway endpoint: {locked_endpoint}")
+
         async with httpx.AsyncClient(
-            verify=False, headers=DEFAULT_HEADERS, http2=True,
-            event_hooks={"response": [log_rate_limit]}
+            headers=DEFAULT_HEADERS,
+            transport=LockedEndpointTransport(locked_endpoint, http2=True),
+            event_hooks={"response": [log_rate_limit]},
+            timeout=30.0,
         ) as client:
             response = await client.get(full_detail_url, cookies=cookie_jar, timeout=15)
 
             if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
                 logger.warning("[MARKS DETAIL] Token expired. Launching auto-login fallback...")
-                async with make_erp_client() as gw_client:
-                    for attempt in range(3):
-                        if attempt > 0:
-                            await asyncio.sleep(random.uniform(1.0, 2.0))
-                        res, cookie_jar = await auto_login(gw_client, username, password, seed_cookies=cookie_jar)
-                        if not is_login_failed(res):
-                            break
-                    else:
-                        raise HTTPException(status_code=401, detail="Session verification recovery rejected.")
+                for attempt in range(3):
+                    if attempt > 0:
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
+                    res, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
+                    if not is_login_failed(res):
+                        break
+                else:
+                    raise HTTPException(status_code=401, detail="Session verification recovery rejected.")
 
                 response = await client.get(full_detail_url, cookies=cookie_jar, timeout=15)
 

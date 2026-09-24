@@ -111,3 +111,68 @@ class ApiGatewayTransport(httpx.AsyncBaseTransport):
 
     async def aclose(self) -> None:
         await self._transport.aclose()
+
+
+class LockedEndpointTransport(httpx.AsyncBaseTransport):
+    """Like ApiGatewayTransport but locks EVERY request in this session to
+    ONE pre-chosen gateway endpoint (instead of picking a random one each
+    time).
+
+    This is required for endpoints where the ERP binds the PHPSESSID cookie
+    to the IP address that originally performed the login.  If different
+    requests in the same flow land on different gateway endpoints (= different
+    AWS egress IPs), the ERP sees an IP mismatch and immediately redirects
+    back to site/login with a 302.
+
+    Usage
+    -----
+    Pick the endpoint once at the start of the request flow:
+
+        endpoint = random.choice(get_gateway_endpoints())
+        transport = LockedEndpointTransport(endpoint)
+        async with httpx.AsyncClient(transport=transport, ...) as client:
+            # every request through `client` uses the same AWS egress IP
+            await auto_login(client, ...)
+            await client.get(register_url, ...)
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        http2: bool = True,
+        verify: bool = True,
+        limits: httpx.Limits | None = None,
+    ):
+        self._endpoint = endpoint
+        self._transport = httpx.AsyncHTTPTransport(
+            verify=verify,
+            http2=http2,
+            limits=limits
+            or httpx.Limits(
+                max_keepalive_connections=10,
+                max_connections=50,
+                keepalive_expiry=30.0,
+            ),
+        )
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        site_path = request.url.raw_path.decode("ascii").lstrip("/")
+        if site_path.startswith(f"{GATEWAY_STAGE}/"):
+            site_path = site_path[len(GATEWAY_STAGE) + 1:]
+
+        request.url = httpx.URL(f"https://{self._endpoint}/{GATEWAY_STAGE}/{site_path}")
+        request.headers["Host"] = self._endpoint
+
+        x_forwarded_for = request.headers.get("X-Forwarded-For")
+        if x_forwarded_for is None:
+            x_forwarded_for = str(
+                ipaddress.IPv4Address(random.randint(0, _MAX_IPV4))
+            )
+        if "X-Forwarded-For" in request.headers:
+            del request.headers["X-Forwarded-For"]
+        request.headers["X-My-X-Forwarded-For"] = x_forwarded_for
+
+        return await self._transport.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
