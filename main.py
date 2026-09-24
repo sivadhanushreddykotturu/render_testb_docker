@@ -879,14 +879,15 @@ async def fetch_register_details(
         ) as client:
             if not php_sess_id or not csrf_cookie:
                 logger.info(f"[LAZY-REGISTER] Cold-start auto-login for {username}")
-                for attempt in range(3):
-                    if attempt > 0:
-                        await asyncio.sleep(random.uniform(1.0, 2.0))
-                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies={})
-                    if not is_login_failed(login_response):
-                        break
-                else:
-                    raise HTTPException(status_code=401, detail="Cold-start login failed. Check credentials.")
+                async with make_erp_client() as gw_client:
+                    for attempt in range(3):
+                        if attempt > 0:
+                            await asyncio.sleep(random.uniform(1.0, 2.0))
+                        login_response, cookie_jar = await auto_login(gw_client, username, password, seed_cookies={})
+                        if not is_login_failed(login_response):
+                            break
+                    else:
+                        raise HTTPException(status_code=401, detail="Cold-start login failed. Check credentials.")
                 active_csrf = extract_csrf(login_response.text)
                 php_sess_id = cookie_jar.get("PHPSESSID", "")
             else:
@@ -897,14 +898,15 @@ async def fetch_register_details(
 
             if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
                 logger.warning("[LAZY-REGISTER] Session invalid or redirected (302). Auto-healing context stream...")
-                for attempt in range(3):
-                    if attempt > 0:
-                        await asyncio.sleep(random.uniform(1.0, 2.0))
-                    login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
-                    if not is_login_failed(login_response):
-                        break
-                else:
-                    raise HTTPException(status_code=401, detail="Authentication credentials expired.")
+                async with make_erp_client() as gw_client:
+                    for attempt in range(3):
+                        if attempt > 0:
+                            await asyncio.sleep(random.uniform(1.0, 2.0))
+                        login_response, cookie_jar = await auto_login(gw_client, username, password, seed_cookies=cookie_jar)
+                        if not is_login_failed(login_response):
+                            break
+                    else:
+                        raise HTTPException(status_code=401, detail="Authentication credentials expired.")
 
                 active_csrf = extract_csrf(login_response.text) or cookie_jar.get("_csrf", "")
                 register_url_with_csrf = f"{register_url}&_csrf={active_csrf}"
@@ -1377,14 +1379,15 @@ async def fetch_marks_detail(
 
             if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
                 logger.warning("[MARKS DETAIL] Token expired. Launching auto-login fallback...")
-                for attempt in range(3):
-                    if attempt > 0:
-                        await asyncio.sleep(random.uniform(1.0, 2.0))
-                    res, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
-                    if not is_login_failed(res):
-                        break
-                else:
-                    raise HTTPException(status_code=401, detail="Session verification recovery rejected.")
+                async with make_erp_client() as gw_client:
+                    for attempt in range(3):
+                        if attempt > 0:
+                            await asyncio.sleep(random.uniform(1.0, 2.0))
+                        res, cookie_jar = await auto_login(gw_client, username, password, seed_cookies=cookie_jar)
+                        if not is_login_failed(res):
+                            break
+                    else:
+                        raise HTTPException(status_code=401, detail="Session verification recovery rejected.")
 
                 response = await client.get(full_detail_url, cookies=cookie_jar, timeout=15)
 
