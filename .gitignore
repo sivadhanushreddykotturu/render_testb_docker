@@ -3,6 +3,7 @@
 
 # Runtime
 logs/
+server_logs/
 venv/
 __pycache__/
 *.pyc

@@ -8,9 +8,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# curl: container healthcheck, ffmpeg: HLS live radio streaming
+# curl: container healthcheck
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ffmpeg \
+    && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -22,9 +22,8 @@ COPY model/ ./model/
 # Run as non-root; pre-create the log dir owned by appuser (only effective
 # when no host bind mount shadows it)
 RUN useradd --create-home appuser \
-    && mkdir -p /app/logs /tmp/hls_radio /tmp/radio_cache \
-    && chown -R appuser:appuser /app /tmp/hls_radio /tmp/radio_cache \
-    && chmod 777 /tmp/hls_radio /tmp/radio_cache
+    && mkdir -p /app/logs \
+    && chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8000

@@ -4,13 +4,6 @@
 # Service (IAM instance-role credentials) without raising the IMDSv2 hop
 # limit, and so PORT binds directly on the instance.
 services:
-  bgutil-provider:
-    image: brainicism/bgutil-ytdlp-pot-provider
-    container_name: bgutil-provider
-    restart: always
-    ports:
-      - "4416:4416"
-
   backend:
     build: .
     container_name: kl-erp-backend
@@ -20,5 +13,3 @@ services:
     volumes:
       - ./logs:/app/logs
       - ./dataset:/app/dataset
-    depends_on:
-      - bgutil-provider
