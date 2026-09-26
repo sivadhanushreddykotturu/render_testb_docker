@@ -808,6 +808,7 @@ async def fetch_attendance_summary(
                 "conducted": re.sub(r'<.*?>', '', cells[8]).strip(),
                 "attended": re.sub(r'<.*?>', '', cells[9]).strip(),
                 "absent": re.sub(r'<.*?>', '', cells[10]).strip(),
+                "tcbr": re.sub(r'<.*?>', '', cells[11]).strip(),
                 "percentage": re.sub(r'<.*?>', '', cells[12]).strip(),
                 "register_href": clean_href
             })
