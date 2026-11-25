@@ -1614,7 +1614,7 @@ async def fetch_internals(
             cookie_jar = collect_cookies(page, cookie_jar)
             result = await client.post(
                 INTERNALS_URL,
-                data={"_csrf": csrf_token, "academicyear": academic_year, "semester": semester},
+                data={"_csrf": csrf_token, "DynamicModel[academicyear]": academic_year, "DynamicModel[semester]": semester},
                 cookies=cookie_jar,
                 timeout=20,
             )
