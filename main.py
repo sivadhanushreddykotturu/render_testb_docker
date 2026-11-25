@@ -1472,6 +1472,266 @@ async def fetch_marks_detail(
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================
+# INTERNALS: LIST COMPONENTS + FETCH ONE COMPONENT (no calculations, raw pass-through)
+# ============================================================
+INTERNALS_URL = f"{BASE_URL}/index.php?r=studentinfo%2Fstudentendexamresult%2Fgetstudentinternalmarks"
+
+
+def _cell_text(el) -> str:
+    return re.sub(r"\s+", " ", el.get_text(" ", strip=True)).strip()
+
+
+def _component_kind(href: str) -> str:
+    h = href.lower()
+    if "internalsummative" in h:
+        return "summative"
+    if "internalformative" in h:
+        return "formative"
+    return "other"
+
+
+def parse_internals_listing(html: str) -> list[dict]:
+    """Course list page -> [{course_code, course_name, academic_year, semester,
+    components: [{name, kind, target_href}]}]. Pure pass-through of what the ERP shows."""
+    soup = BeautifulSoup(html, "lxml")
+    courses = []
+    for table in soup.find_all("table"):
+        headers = [_cell_text(th).lower() for th in table.find_all("th")]
+        if not any("evaluation" in h for h in headers):
+            continue
+        for tr in table.find_all("tr"):
+            tds = tr.find_all("td", recursive=False)
+            if len(tds) < 6:
+                continue
+            components = []
+            for a in tds[5].find_all("a", href=True):
+                href = a["href"]  # keep EXACTLY as the ERP gave it (do not decode the id)
+                components.append({
+                    "name": _cell_text(a),
+                    "kind": _component_kind(href),
+                    "target_href": href,
+                })
+            courses.append({
+                "sno": _cell_text(tds[0]),
+                "academic_year": _cell_text(tds[1]),
+                "semester": _cell_text(tds[2]),
+                "course_code": _cell_text(tds[3]),
+                "course_name": _cell_text(tds[4]),
+                "components": components,
+            })
+        break
+    return courses
+
+
+def parse_internal_component(html: str) -> dict:
+    """One component page -> {published, columns, rows}. Works for every layout seen so far:
+    - Semester in Exam-I/II style: question-part columns (1 A, 2 B ...) + Max/Weight/Total/Weighted
+    - Skill In-Sem / lab / quiz style: numeric columns (1, 2, 3 ...) + Max/Weight/Total/Weighted
+    - formative / CO-wise style: Co1..Co4 etc.
+    Values are returned as the ERP printed them (-1, -2, 'A' are NOT interpreted).
+    If the ERP has nothing published it returns its whole page with 'No results found'
+    and no marks table: published=false."""
+    soup = BeautifulSoup(html, "lxml")
+    table = None
+    for t in soup.find_all("table"):
+        if t.find("th") and t.find("td"):
+            table = t
+            break
+    if table is None:
+        return {"published": False, "columns": [], "rows": [], "message": "No results found" if "no results found" in html.lower() else "No marks table on page"}
+    head = table.find("thead")
+    header_cells = (head.find_all("th") if head else table.find("tr").find_all("th"))
+    columns = [_cell_text(th) for th in header_cells]
+    body = table.find("tbody") or table
+    rows = []
+    for tr in body.find_all("tr"):
+        tds = tr.find_all("td", recursive=False)
+        if not tds:
+            continue
+        vals = [_cell_text(td) for td in tds]
+        rows.append({
+            "cells": vals,
+            "by_column": {(columns[i] if i < len(columns) else f"col{i}"): v for i, v in enumerate(vals)},
+        })
+    return {"published": bool(rows), "columns": columns, "rows": rows}
+
+
+@app.post("/fetch-internals")
+@with_gateway_retries(max_retries=3)
+@single_flight_cached(
+    route_name="internals_list",
+    key_builder=lambda kwargs: (
+        "internals_list",
+        kwargs.get("username", "").strip(),
+        str(kwargs.get("academic_year", "")).strip(),
+        str(kwargs.get("semester", "")).strip(),
+    )
+)
+async def fetch_internals(
+    username: str = Form(...),
+    password: str = Form(...),
+    academic_year: str = Form(default="29"),   # ERP option value: 29=2026-27, 19=2025-26, 16=2024-25
+    semester: str = Form(default="1"),         # 1=Odd, 2=Even
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
+    server_id: str = Form(default="erp1")
+):
+    """Subjects + the evaluation components available for each (name, kind, target_href)."""
+    start_time = time.time()
+    cookie_jar = {
+        "_csrf": unquote(csrf_cookie) if csrf_cookie else "",
+        "PHPSESSID": php_sess_id,
+        "kl_erp_device_id": unquote(device_id) if device_id else "",
+        "SERVERID": server_id
+    }
+    try:
+        async with make_erp_client() as client:
+            if not php_sess_id or not csrf_cookie:
+                for attempt in range(3):
+                    if attempt > 0:
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
+                    res, cookie_jar = await auto_login(client, username, password, seed_cookies={})
+                    if not is_login_failed(res):
+                        break
+                else:
+                    raise HTTPException(status_code=401, detail="Authentication initialization failed.")
+
+            page = await client.get(INTERNALS_URL, cookies=cookie_jar, timeout=15)
+            if page.status_code in (301, 302, 303) or page.status_code == 500 or is_login_failed(page):
+                for attempt in range(3):
+                    if attempt > 0:
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
+                    res, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
+                    if not is_login_failed(res):
+                        break
+                else:
+                    raise HTTPException(status_code=401, detail="Gateway authentication dropped permanently.")
+                page = await client.get(INTERNALS_URL, cookies=cookie_jar, timeout=15)
+            page.raise_for_status()
+
+            csrf_token = extract_csrf(page.text)
+            cookie_jar = collect_cookies(page, cookie_jar)
+            result = await client.post(
+                INTERNALS_URL,
+                data={"_csrf": csrf_token, "academicyear": academic_year, "semester": semester},
+                cookies=cookie_jar,
+                timeout=20,
+            )
+            result.raise_for_status()
+            courses = parse_internals_listing(result.text)
+
+        if not courses:
+            raise HTTPException(status_code=404, detail="No internals listed for this academic year / semester.")
+
+        updated_session_id = cookie_jar.get("PHPSESSID")
+        final_csrf = cookie_jar.get("_csrf", unquote(csrf_cookie) if csrf_cookie else "")
+        record_latency("internals_list", (time.time() - start_time) * 1000.0, 200)
+        return {
+            "success": True,
+            "session_refreshed": updated_session_id != php_sess_id,
+            "cookies": {
+                "PHPSESSID": updated_session_id,
+                "kl_erp_device_id": cookie_jar.get("kl_erp_device_id", device_id),
+                "SERVERID": cookie_jar.get("SERVERID", server_id),
+                "_csrf_token": final_csrf,
+                "_csrf": final_csrf
+            },
+            "academic_year": academic_year,
+            "semester": semester,
+            "courses": courses
+        }
+    except HTTPException:
+        raise
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError, GatewayUnavailableError) as net_err:
+        if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
+            raise
+        raise GatewayRequestError("ERP request failed via API Gateway")
+    except Exception as e:
+        logger.error(f"[INTERNALS LIST ERROR] {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/fetch-internal-component")
+@with_gateway_retries(max_retries=3)
+@single_flight_cached(
+    route_name="internals_component",
+    key_builder=lambda kwargs: (
+        "internals_component",
+        kwargs.get("username", "").strip(),
+        str(kwargs.get("target_href", "")).strip()
+    )
+)
+async def fetch_internal_component(
+    target_href: str = Form(...),   # exactly the target_href from /fetch-internals
+    username: str = Form(...),
+    password: str = Form(...),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
+    server_id: str = Form(default="erp1")
+):
+    """Raw marks of ONE component (works for Semester in Exam, Skill In-Sem, quiz, lab, ...)."""
+    start_time = time.time()
+    cookie_jar = {
+        "_csrf": unquote(csrf_cookie) if csrf_cookie else "",
+        "PHPSESSID": php_sess_id,
+        "kl_erp_device_id": unquote(device_id) if device_id else "",
+        "SERVERID": server_id
+    }
+    full_url = target_href if target_href.startswith("http") else f"{BASE_URL}/{target_href.lstrip('/')}"
+    try:
+        # same two-client strategy as /fetch-marks-detail: login via gateway, fetch directly
+        async with httpx.AsyncClient(
+            verify=False, headers=DEFAULT_HEADERS, http2=True,
+            event_hooks={"response": [log_rate_limit]}
+        ) as direct_client:
+            response = await direct_client.get(full_url, cookies=cookie_jar, timeout=20)
+            if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
+                async with make_erp_client() as gw_client:
+                    for attempt in range(3):
+                        if attempt > 0:
+                            await asyncio.sleep(random.uniform(1.0, 2.0))
+                        res, cookie_jar = await auto_login(gw_client, username, password, seed_cookies=cookie_jar)
+                        if not is_login_failed(res):
+                            break
+                    else:
+                        raise HTTPException(status_code=401, detail="Session verification recovery rejected.")
+                if not cookie_jar.get("SERVERID"):
+                    cookie_jar["SERVERID"] = "erp1"
+                response = await direct_client.get(full_url, cookies=cookie_jar, timeout=20)
+            if response.status_code in (400, 404):
+                raise HTTPException(status_code=404, detail="Component link is stale. Call /fetch-internals again and use the new target_href.")
+            response.raise_for_status()
+            parsed = parse_internal_component(response.text)
+
+        updated_session_id = cookie_jar.get("PHPSESSID")
+        final_csrf = cookie_jar.get("_csrf", unquote(csrf_cookie) if csrf_cookie else "")
+        record_latency("internals_component", (time.time() - start_time) * 1000.0, 200)
+        return {
+            "success": True,
+            "session_refreshed": updated_session_id != php_sess_id,
+            "cookies": {
+                "PHPSESSID": updated_session_id,
+                "kl_erp_device_id": cookie_jar.get("kl_erp_device_id", device_id),
+                "SERVERID": cookie_jar.get("SERVERID", server_id),
+                "_csrf_token": final_csrf,
+                "_csrf": final_csrf
+            },
+            **parsed
+        }
+    except HTTPException:
+        raise
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError, GatewayUnavailableError) as net_err:
+        if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
+            raise
+        raise GatewayRequestError("ERP request failed via API Gateway")
+    except Exception as e:
+        logger.error(f"[INTERNAL COMPONENT ERROR] {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
 # AUTO-FEEDBACK SUBMISSION (personal use only)
 # ============================================================
 
@@ -1845,6 +2105,8 @@ _BENCHMARK_ROUTES = [
     {"key": "attendance", "name": "Attendance", "path": "/fetch-attendance"},
     {"key": "cgpa", "name": "CGPA Ledger", "path": "/fetch-cgpa"},
     {"key": "internal_marks", "name": "Internal Marks", "path": "/fetch-marks-detail"},
+    {"key": "internals_list", "name": "Internals List", "path": "/fetch-internals"},
+    {"key": "internals_component", "name": "Internal Component", "path": "/fetch-internal-component"},
 ]
 
 def get_benchmark_stats(time_range: str = "all") -> dict:
