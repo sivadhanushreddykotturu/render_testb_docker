@@ -50,30 +50,22 @@ try:
 except Exception as e:
     pass  # Rely on basic logging below if needed, or silently continue if DB init fails locally
 
-from requests_ip_rotator import ApiGateway
-from gateway_proxy import ApiGatewayTransport, GatewayUnavailableError, LockedEndpointTransport
-
-
 class GatewayRequestError(Exception):
-    """Transient network/gateway failure while talking to the ERP through
-    AWS API Gateway. Triggers a full endpoint retry (each attempt egresses
-    from a fresh gateway endpoint / AWS IP)."""
+    pass
 
 
 def with_gateway_retries(max_retries: int = 3):
+    """No-op decorator — AWS gateway removed. Kept so endpoint decorators don't break."""
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
-            for attempt in range(max_retries):
-                try:
-                    return await func(*args, **kwargs)
-                except GatewayRequestError:
-                    if attempt == max_retries - 1:
-                        raise HTTPException(
-                            status_code=503,
-                            detail="University ERP portal is down or under maintenance. Please try again later."
-                        )
-                    logger.info(f"Retrying endpoint {func.__name__} (attempt {attempt + 2}/{max_retries})")
+            try:
+                return await func(*args, **kwargs)
+            except GatewayRequestError:
+                raise HTTPException(
+                    status_code=503,
+                    detail="University ERP portal is down or under maintenance. Please try again later."
+                )
         return wrapper
     return decorator
 
@@ -171,58 +163,20 @@ DEFAULT_HEADERS = {
     "Upgrade-Insecure-Requests": "1"
 }
 
-# ------------------ AWS API GATEWAY IP-ROTATION PROXY ------------------
-# The API Gateway infrastructure is managed by requests-ip-rotator and is
-# started ONCE in the FastAPI lifespan below. Gateways are reused by name
-# across restarts (start() finds pre-existing APIs instead of recreating).
-#
-# Auth resolution order (boto3 default chain): these env vars, then the EC2
-# instance IAM role. An instance role is recommended — leave the env vars
-# unset when one is attached.
-AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID") or None
-AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY") or None
-
-# India regions only — keeps gateway egress geographically close to the ERP.
-GATEWAY_REGIONS = [
-    r.strip()
-    for r in os.environ.get("AWS_GATEWAY_REGIONS", "ap-south-1,ap-south-2").split(",")
-    if r.strip()
-]
-
-# Gateways cost ~$0 idle (pay-per-request) and start() reuses them by name,
-# so the production default is to KEEP them on shutdown for fast restarts.
-DELETE_GATEWAYS_ON_SHUTDOWN = (
-    os.environ.get("DELETE_GATEWAYS_ON_SHUTDOWN", "false").strip().lower() == "true"
-)
-
-gateway_manager: ApiGateway | None = None
-
-
 def get_gateway_endpoints() -> list[str]:
-    """Live list of gateway endpoint hosts, read lazily per request."""
-    if gateway_manager is None:
-        return []
-    return gateway_manager.endpoints
+    return []
 
 
 async def log_rate_limit(response: httpx.Response):
-    """httpx response event hook. Logs every 429 the ERP returns, tagged with
-    the gateway endpoint that egressed the request, so throttling is
-    attributable to a specific API Gateway instead of guessed."""
     if response.status_code == 429:
-        logger.warning(
-            f"[RATE_LIMIT] status=429 via_gateway={response.url.host} url={response.url}"
-        )
+        logger.warning(f"[RATE_LIMIT] status=429 url={response.url}")
 
 
-def make_erp_client(http2: bool = True, **overrides) -> httpx.AsyncClient:
-    """One AsyncClient per logical operation. Every request is routed through
-    a random AWS API Gateway endpoint (rotating AWS egress IPs) by the
-    ApiGatewayTransport. TLS terminates at AWS with a valid ACM cert, so
-    verification stays enabled."""
+def make_erp_client(http2: bool = False, **overrides) -> httpx.AsyncClient:
+    """Direct connection to the ERP — no AWS gateway needed."""
     options = dict(
         headers=DEFAULT_HEADERS,
-        transport=ApiGatewayTransport(get_gateway_endpoints, http2=http2),
+        verify=False,
         event_hooks={"response": [log_rate_limit]},
         timeout=30.0,
     )
@@ -232,38 +186,14 @@ def make_erp_client(http2: bool = True, **overrides) -> httpx.AsyncClient:
 # ------------------ GLOBAL CONNECTION LIFESPAN ------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global gateway_manager, _main_asyncio_loop
+    global _main_asyncio_loop
     try:
         _main_asyncio_loop = asyncio.get_running_loop()
     except Exception:
         pass
-    logger.info("✅ FastAPI app starting (AWS API Gateway IP-Rotation Engine)...")
-
-    # Start gateways ONCE for the whole process lifetime. boto3 calls are
-    # blocking, so they run in a thread — never inside a request handler.
-    gateway_manager = ApiGateway(
-        BASE_URL,
-        regions=GATEWAY_REGIONS,
-        access_key_id=AWS_ACCESS_KEY_ID,
-        access_key_secret=AWS_SECRET_ACCESS_KEY,
-    )
-    endpoints = await asyncio.to_thread(gateway_manager.start)
-    if not endpoints:
-        raise RuntimeError(
-            f"No AWS API Gateway endpoints could be initialised in {GATEWAY_REGIONS}. "
-            "Check AWS credentials / IAM permissions (apigateway:*) and region access."
-        )
-    logger.info(
-        f"🚀 {len(endpoints)} API Gateway endpoint(s) live in {GATEWAY_REGIONS}: {endpoints}"
-    )
-
+    logger.info("FastAPI app starting (direct ERP connection, no AWS gateway)...")
     yield
-
-    if DELETE_GATEWAYS_ON_SHUTDOWN:
-        logger.info("🛑 Deleting API Gateways (DELETE_GATEWAYS_ON_SHUTDOWN=true)...")
-        await asyncio.to_thread(gateway_manager.shutdown)
-    else:
-        logger.info("🛑 App stopped. API Gateways left in place (reused by name on next start).")
+    logger.info("App stopped.")
 
 app = FastAPI(title="TimeTable & Attendance Backend", version="8.0.0", lifespan=lifespan)
 
@@ -314,14 +244,9 @@ async def global_exception_handler(request: Request, exc: Exception):
 # ------------------ HEALTH ------------------
 @app.get("/")
 def health():
-    endpoints = get_gateway_endpoints()
     return {
-        "message": "Backend running high-speed concurrent loops ✅",
+        "message": "Backend running high-speed concurrent loops",
         "status": "healthy",
-        "gateway": {
-            "regions": GATEWAY_REGIONS,
-            "endpoints_live": len(endpoints),
-        },
     }
 
 # ------------------ DATA FLYWHEEL STATS ------------------
@@ -420,108 +345,204 @@ async def _follow_redirects_collecting_cookies(
 
     return resp, current_cookies
 
-# ------------------ AUTO LOGIN (FIREWALL BYPASS ENGINE) ------------------
-async def auto_login(client: httpx.AsyncClient, username: str, password: str, seed_cookies: dict) -> tuple[httpx.Response, dict]:
-    login_url = f"{BASE_URL}/index.php?r=site%2Flogin"
-    logger.info(f"[LOGIN] Running thread-isolated ONNX auto-login for user={username}")
+# ------------------ AUTO LOGIN (RATE-LIMIT-FRIENDLY ENGINE) ------------------
+LOGIN_MAX_CAPTCHA_ATTEMPTS = 3
+LOGIN_COOLDOWN_SECONDS = int(os.environ.get("LOGIN_COOLDOWN_SECONDS", "60"))
+LOGIN_MEMO_SECONDS = float(os.environ.get("LOGIN_MEMO_SECONDS", "10"))
+LOGIN_MAX_PARALLEL = int(os.environ.get("LOGIN_MAX_PARALLEL", "64"))
 
-    local_headers = dict(DEFAULT_HEADERS)
+_login_cooldown_until = 0.0
+_login_inflight: dict = {}
+_login_memo: dict = {}
+_login_sema: asyncio.Semaphore | None = None
 
-    # Step 1: Initial Cold Handshake
-    res, step_cookies = await _follow_redirects_collecting_cookies(client, "GET", login_url, {}, headers=local_headers)
+
+def _get_login_sema() -> asyncio.Semaphore:
+    global _login_sema
+    if _login_sema is None:
+        _login_sema = asyncio.Semaphore(LOGIN_MAX_PARALLEL)
+    return _login_sema
+
+
+def _raise_login_rate_limited(retry_after: int | None = None):
+    retry_after = int(retry_after or LOGIN_COOLDOWN_SECONDS)
+    raise HTTPException(
+        status_code=429,
+        detail=f"The ERP is rate-limiting logins. Please try again in {retry_after} seconds.",
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+def _login_step_ok(res: httpx.Response, step: str, username: str, attempt: int):
+    global _login_cooldown_until
+    logger.info(f"[LOGIN] user={username} attempt={attempt} step={step} status={res.status_code}")
+    if res.status_code == 429:
+        _login_cooldown_until = time.time() + LOGIN_COOLDOWN_SECONDS
+        logger.warning(f"[LOGIN] 429 at step={step} - login cool-down {LOGIN_COOLDOWN_SECONDS}s")
+        _raise_login_rate_limited()
     res.raise_for_status()
 
-    csrf = extract_csrf(res.text)
+
+def _captcha_url_from(html: str) -> str | None:
+    m = re.search(r'src="([^"]*?r=site%2Fcaptcha[^"]*?)"', html)
+    return BASE_URL + m.group(1).replace("&amp;", "&") if m else None
+
+
+FRIEND_HEADERS = {
+    "User-Agent": DEFAULT_HEADERS["User-Agent"],
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_ONE_SOCKET = httpx.Limits(max_connections=1, max_keepalive_connections=1, keepalive_expiry=30.0)
+
+
+def _new_login_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        headers=FRIEND_HEADERS, limits=_ONE_SOCKET, verify=False,
+        event_hooks={"response": [log_rate_limit]}, timeout=30.0,
+    )
+
+
+def _hidden_inputs(html: str) -> dict:
+    return {
+        i["name"]: i.get("value", "")
+        for i in BeautifulSoup(html, "lxml").find_all("input", attrs={"type": "hidden"})
+        if i.get("name")
+    }
+
+
+async def _login_once(client: httpx.AsyncClient, username: str, password: str, attempt: int):
+    login_url = f"{BASE_URL}/index.php?r=site%2Flogin"
+
+    res, cookies = await _follow_redirects_collecting_cookies(client, "GET", login_url, {})
+    _login_step_ok(res, "page", username, attempt)
+    hidden = _hidden_inputs(res.text)
+    csrf = hidden.get("_csrf") or extract_csrf(res.text)
     if not csrf:
         raise Exception("CSRF token not found on login page.")
+    captcha_url = _captcha_url_from(res.text) or f"{BASE_URL}/index.php?r=site%2Fcaptcha&v={int(time.time() * 1000)}"
 
-    # Step 2: Mimic human browser delay processing layout
-    await asyncio.sleep(random.uniform(0.1, 0.2))
-
-    dummy_data = {"_csrf": csrf, "LoginForm[username]": "", "LoginForm[password]": ""}
-
-    local_headers["Origin"] = BASE_URL
-    local_headers["Referer"] = login_url
-    local_headers["Sec-Fetch-Site"] = "same-origin"
-    local_headers["Sec-Fetch-Mode"] = "cors"
-    local_headers["Sec-Fetch-Dest"] = "empty"
-
-    res_post, step_cookies = await _follow_redirects_collecting_cookies(
-        client, "POST", login_url, step_cookies, data=dummy_data, headers=local_headers
+    cap, cookies = await _follow_redirects_collecting_cookies(
+        client, "GET", captcha_url, cookies, headers={"Referer": login_url}
     )
-    res_post.raise_for_status()
-
-    captcha_match = re.search(r'src="([^"]*?r=site%2Fcaptcha[^"]*?)"', res_post.text)
-    if not captcha_match:
-        raise Exception("CAPTCHA image locator missing from layout.")
-
-    # Step 3: Pull Captcha Image Layer
-    captcha_url = BASE_URL + captcha_match.group(1).replace("&amp;", "&")
-
-    local_headers["Accept"] = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
-    local_headers["Sec-Fetch-Mode"] = "no-cors"
-    local_headers["Sec-Fetch-Dest"] = "image"
-    local_headers["Referer"] = login_url
-
-    captcha_response, step_cookies = await _follow_redirects_collecting_cookies(
-        client, "GET", captcha_url, step_cookies, headers=local_headers
-    )
-    captcha_response.raise_for_status()
-
-    # Step 4: Run High-Speed ONNX Calculation
-    captcha_text = solve_captcha(captcha_response.content)
+    _login_step_ok(cap, "captcha", username, attempt)
+    captcha_text = (await asyncio.to_thread(solve_captcha, cap.content)).strip()
     logger.info(f"[LOGIN] Captcha solved: {captcha_text}")
 
-    # Step 5: Final Submission with Re-calibrated Headers
-    payload = {
+    payload = dict(hidden)
+    payload.update({
         "_csrf": csrf,
         "LoginForm[username]": username,
         "LoginForm[password]": password,
         "LoginForm[captcha]": captcha_text,
-        "LoginForm[rememberMe]": "0",
-        "LoginForm[qr_code]": "",
-    }
-
-    local_headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
-    local_headers["Sec-Fetch-Mode"] = "navigate"
-    local_headers["Sec-Fetch-Dest"] = "document"
-    local_headers["Sec-Fetch-User"] = "?1"
-
-    # Anti-bot computational delay padding signature
-    await asyncio.sleep(random.uniform(0.05, 0.15))
-
+        "LoginForm[qr_code]": "123456",
+        "login-button": "",
+        "yt0": "Login",
+    })
     response, final_cookies = await _follow_redirects_collecting_cookies(
-        client, "POST", login_url, step_cookies, data=payload, headers=local_headers
+        client, "POST", login_url, cookies, data=payload,
+        headers={
+            "Referer": login_url,
+            "X-Requested-With": "XMLHttpRequest",
+            "X-CSRF-Token": csrf,
+            "X-PJAX": "true",
+            "X-PJAX-Container": "#login-jax",
+        },
     )
-    response.raise_for_status()
+    pjax_target = response.headers.get("x-pjax-url")
+    if response.status_code in (301, 302, 303) and not response.headers.get("location") and pjax_target:
+        logger.info(f"[LOGIN] user={username} attempt={attempt} step=login_post status={response.status_code} (pjax redirect)")
+        response, final_cookies = await _follow_redirects_collecting_cookies(client, "GET", pjax_target, final_cookies)
+        _login_step_ok(response, "dashboard", username, attempt)
+    else:
+        _login_step_ok(response, "login_post", username, attempt)
+    return response, final_cookies, captcha_text, cap.content
 
-    # --- DATA FLYWHEEL LOGIC ---
-    if not is_login_failed(response):
+
+def _save_verified_captcha(captcha_text: str, captcha_bytes: bytes):
+    if os.environ.get("CAPTCHA_FLYWHEEL", "0") != "1":
+        return
+
+    def _bg():
         try:
-            img_hash = hashlib.md5(captcha_response.content).hexdigest()
+            img_hash = hashlib.md5(captcha_bytes).hexdigest()
             filename = f"{captcha_text}_{img_hash}.png"
             timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            
             with sqlite3.connect(DB_PATH, timeout=5.0) as conn:
                 conn.execute(
                     "INSERT INTO captchas (image_hash, text_label, filename, created_at) VALUES (?, ?, ?, ?)",
                     (img_hash, captcha_text, filename, timestamp)
                 )
-            
             with open(os.path.join(IMAGES_DIR, filename), "wb") as f:
-                f.write(captcha_response.content)
-            logger.info(f"[FLYWHEEL] Saved new verified captcha: {filename}")
+                f.write(captcha_bytes)
         except sqlite3.IntegrityError:
-            pass  # Duplicate hash, silently ignore
+            pass
         except Exception as e:
             logger.error(f"[FLYWHEEL] Error saving dataset: {e}")
-    # ---------------------------
 
+    threading.Thread(target=_bg, daemon=True).start()
+
+
+async def _login_worker(username: str, password: str) -> tuple[httpx.Response, dict]:
+    async with _get_login_sema():
+        async with _new_login_client() as client:
+            for attempt in range(1, LOGIN_MAX_CAPTCHA_ATTEMPTS + 1):
+                response, cookies, captcha_text, captcha_bytes = await _login_once(client, username, password, attempt)
+                if not is_login_failed(response):
+                    _save_verified_captcha(captcha_text, captcha_bytes)
+                    return response, cookies
+
+                blocks = " ".join(
+                    h.get_text(" ", strip=True) for h in BeautifulSoup(response.text, "lxml").select(".help-block")
+                ).lower()
+                captcha_bad = "verification code is incorrect" in blocks
+                creds_bad = "incorrect username or password" in blocks
+                if creds_bad:
+                    logger.warning(f"[LOGIN] user={username} rejected: wrong username or password (no retry)")
+                    raise HTTPException(status_code=401, detail="Incorrect username or password.")
+
+                logger.warning(f"[LOGIN] user={username} attempt={attempt} rejected (captcha_bad={captcha_bad}). "
+                               f"{'Retrying with a fresh captcha.' if attempt < LOGIN_MAX_CAPTCHA_ATTEMPTS else 'Giving up.'}")
+                if attempt < LOGIN_MAX_CAPTCHA_ATTEMPTS:
+                    await asyncio.sleep(random.uniform(0.7, 1.3) * attempt)
+    raise HTTPException(status_code=401, detail="Invalid credentials or captcha timeout.")
+
+
+def _with_seed(cookies: dict, seed_cookies: dict) -> dict:
+    cookies = dict(cookies)
     for key in ("kl_erp_device_id", "SERVERID"):
-        if key not in final_cookies and key in seed_cookies:
-            final_cookies[key] = seed_cookies[key]
+        if key not in cookies and key in (seed_cookies or {}):
+            cookies[key] = seed_cookies[key]
+    return cookies
 
-    return response, final_cookies
+
+async def auto_login(client: httpx.AsyncClient, username: str, password: str, seed_cookies: dict) -> tuple[httpx.Response, dict]:
+    """Rate-limit-friendly login. `client` is ignored — each login gets its own single-IP client."""
+    key = (username.strip(), hashlib.sha256(password.encode("utf-8")).hexdigest())
+    now = time.time()
+
+    memo = _login_memo.get(key)
+    if memo and now - memo[0] < LOGIN_MEMO_SECONDS:
+        logger.info(f"[LOGIN] user={username} reusing the login done {now - memo[0]:.1f}s ago")
+        return memo[1], _with_seed(memo[2], seed_cookies)
+
+    task = _login_inflight.get(key)
+    if task is None:
+        if now < _login_cooldown_until:
+            _raise_login_rate_limited(int(_login_cooldown_until - now) + 1)
+        logger.info(f"[LOGIN] Running thread-isolated ONNX auto-login for user={username}")
+        task = asyncio.ensure_future(_login_worker(username, password))
+        _login_inflight[key] = task
+        task.add_done_callback(lambda _t, _k=key: _login_inflight.pop(_k, None))
+    else:
+        logger.info(f"[LOGIN] user={username} joining the login already in progress")
+
+    response, cookies = await asyncio.shield(task)
+    _login_memo[key] = (time.time(), response, cookies)
+    if len(_login_memo) > 500:
+        for old_key in [k for k, v in _login_memo.items() if time.time() - v[0] > LOGIN_MEMO_SECONDS]:
+            _login_memo.pop(old_key, None)
+    return response, _with_seed(cookies, seed_cookies)
 
 def build_register_url(base_url: str, href: str) -> str | None:
     try:
@@ -663,7 +684,7 @@ async def login(username: str = Form(...), password: str = Form(...)):
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         logger.error(f"[NETWORK REJECTION] /login - University gateway down: {net_err}")
-        raise GatewayRequestError("ERP request failed via API Gateway")
+        raise HTTPException(status_code=502, detail="ERP request failed")
     except Exception as e:
         logger.error(f"[LOGIN_ROUTE] Exception: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal processing fault during authorization sync.")
@@ -837,7 +858,7 @@ async def fetch_attendance_summary(
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         logger.error(f"[NETWORK REJECTION] /fetch-attendance - University gateway down: {net_err}")
-        raise GatewayRequestError("ERP request failed via API Gateway")
+        raise HTTPException(status_code=502, detail="ERP request failed")
     except Exception as e:
         logger.error(f"[ATTENDANCE] Crash: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -986,7 +1007,7 @@ async def fetch_register_details(
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         logger.error(f"[NETWORK REJECTION] /fetch-register-detail - University gateway down: {net_err}")
-        raise GatewayRequestError("ERP request failed via API Gateway")
+        raise HTTPException(status_code=502, detail="ERP request failed")
     except Exception as e:
         logger.error(f"[REGISTER] Crash: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -1093,7 +1114,7 @@ async def fetch_seating_plan(
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         logger.error(f"[NETWORK REJECTION] /fetch-seating-plan - University gateway down: {net_err}")
-        raise GatewayRequestError("ERP request failed via API Gateway")
+        raise HTTPException(status_code=502, detail="ERP request failed")
     except Exception as e:
         logger.error(f"[SEATING] Crash: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -1217,7 +1238,7 @@ async def fetch_timetable(
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         logger.error(f"[NETWORK REJECTION] /fetch-timetable - University gateway down: {net_err}")
-        raise GatewayRequestError("ERP request failed via API Gateway")
+        raise HTTPException(status_code=502, detail="ERP request failed")
     except Exception as e:
         logger.error(f"[TIMETABLE] Crash: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -1343,7 +1364,7 @@ async def fetch_cgpa_summary(
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         logger.error(f"[NETWORK REJECTION] /fetch-cgpa - University gateway down: {net_err}")
-        raise GatewayRequestError("ERP request failed via API Gateway")
+        raise HTTPException(status_code=502, detail="ERP request failed")
     except Exception as e:
         logger.error(f"[CGPA ERROR] Processing sequence crashed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -1466,7 +1487,7 @@ async def fetch_marks_detail(
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         logger.error(f"[NETWORK REJECTION] /fetch-marks-detail - University gateway down: {net_err}")
-        raise GatewayRequestError("ERP request failed via API Gateway")
+        raise HTTPException(status_code=502, detail="ERP request failed")
     except Exception as e:
         logger.error(f"[MARKS ERROR] Deep scorecard extraction failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -1646,7 +1667,7 @@ async def fetch_internals(
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError, GatewayUnavailableError) as net_err:
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
-        raise GatewayRequestError("ERP request failed via API Gateway")
+        raise HTTPException(status_code=502, detail="ERP request failed")
     except Exception as e:
         logger.error(f"[INTERNALS LIST ERROR] {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -1725,7 +1746,7 @@ async def fetch_internal_component(
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError, GatewayUnavailableError) as net_err:
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
-        raise GatewayRequestError("ERP request failed via API Gateway")
+        raise HTTPException(status_code=502, detail="ERP request failed")
     except Exception as e:
         logger.error(f"[INTERNAL COMPONENT ERROR] {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -2008,7 +2029,7 @@ async def auto_feedback(
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         logger.error(f"[NETWORK] /auto-feedback - ERP unreachable: {net_err}")
-        raise GatewayRequestError("ERP request failed via API Gateway")
+        raise HTTPException(status_code=502, detail="ERP request failed")
     except Exception as e:
         logger.error(f"[FEEDBACK] Crash: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

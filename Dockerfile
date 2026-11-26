@@ -1,4 +1,4 @@
-# KL ERP Backend — FastAPI + Gunicorn + AWS API Gateway IP rotation
+# KL ERP Backend — FastAPI + Gunicorn (direct ERP connection)
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -16,7 +16,7 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-COPY main.py gateway_proxy.py gunicorn_conf.py ./
+COPY main.py gunicorn_conf.py ./
 COPY model/ ./model/
 
 # Run as non-root; pre-create the log dir owned by appuser (only effective
@@ -31,6 +31,4 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
     CMD curl -fsS "http://localhost:${PORT}/" || exit 1
 
-# Gunicorn master pre-creates/reuses the API Gateways (on_starting hook),
-# then forks Uvicorn workers whose lifespan attaches to the same gateways.
 CMD ["gunicorn", "-c", "gunicorn_conf.py", "main:app"]
