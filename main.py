@@ -1609,6 +1609,300 @@ async def fetch_internal_component(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ============================================================
+# HOSTEL OUTPASS: list / allowed in-times / apply local / apply home
+# (ported from the friend's timetablebot erp/outpass.py onto our login + auto-relogin path)
+# ============================================================
+_OUTPASS_BASE = f"{BASE_URL}/index.php?r=hostel%2Fhostel-student-outpass-requests-info%2F"
+URL_OUTPASS_LIST = _OUTPASS_BASE + "my_outpass_list"
+URL_OUTPASS_LOCAL = _OUTPASS_BASE + "apply_outpass"
+URL_OUTPASS_HOME = _OUTPASS_BASE + "apply_outpass2"
+URL_OUTPASS_INTIME = _OUTPASS_BASE + "get_intime_jax"
+_OP = "HostelStudentOutpassRequestsInfo"
+_RE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_RE_TIME = re.compile(r"^\d{2}:\d{2}:\d{2}$")
+_RE_DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+
+def _session_jar(php_sess_id: str, csrf_cookie: str, device_id: str, server_id: str) -> dict:
+    return {
+        "_csrf": unquote(csrf_cookie) if csrf_cookie else "",
+        "PHPSESSID": php_sess_id,
+        "kl_erp_device_id": unquote(device_id) if device_id else "",
+        "SERVERID": server_id,
+    }
+
+
+def _session_response(cookie_jar: dict, php_sess_id: str, device_id: str, server_id: str, csrf: str) -> dict:
+    new_sid = cookie_jar.get("PHPSESSID")
+    final_csrf = cookie_jar.get("_csrf", csrf)
+    return {
+        "session_refreshed": new_sid != php_sess_id,
+        "cookies": {
+            "PHPSESSID": new_sid,
+            "kl_erp_device_id": cookie_jar.get("kl_erp_device_id", device_id),
+            "SERVERID": cookie_jar.get("SERVERID", server_id),
+            "_csrf_token": final_csrf,
+            "_csrf": final_csrf,
+        },
+    }
+
+
+async def _authed_get(client: httpx.AsyncClient, url: str, cookie_jar: dict, username: str, password: str):
+    """GET with automatic re-login when the session is expired or missing."""
+    resp, cookie_jar = await _follow_redirects_collecting_cookies(client, "GET", url, cookie_jar, timeout=20)
+    if is_login_failed(resp):
+        for attempt in range(3):
+            if attempt > 0:
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+            login_response, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
+            if not is_login_failed(login_response):
+                break
+        else:
+            raise HTTPException(status_code=401, detail="ERP login failed. Check credentials.")
+        resp, cookie_jar = await _follow_redirects_collecting_cookies(client, "GET", url, cookie_jar, timeout=20)
+        if is_login_failed(resp):
+            raise HTTPException(status_code=401, detail="ERP session expired. Please re-login.")
+    if resp.status_code >= 400:
+        resp.raise_for_status()
+    return resp, cookie_jar
+
+
+def _parse_outpass_list(html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "lxml")
+    table = soup.find("table")
+    if not table:
+        return []
+    out = []
+    for row in table.find_all("tr"):
+        cols = [td.get_text(strip=True) for td in row.find_all("td")]
+        if len(cols) >= 12 and cols[1].isdigit():
+            view_a = row.find("a", title="View")
+            href = view_a.get("href") if view_a else ""
+            out.append({
+                "id": cols[1],
+                "student_id": cols[2],
+                "outing_date": cols[3],
+                "out_time": cols[4],
+                "in_time": cols[5],
+                "reason": cols[6],
+                "warden_name": cols[9],
+                "status": cols[10] or "Pending",
+                "approved_by": cols[11] or "N/A",
+                "cancellation_status": cols[12] if len(cols) > 12 else "",
+                "view_url": f"{BASE_URL}{href}" if href and href.startswith("/") else (href or ""),
+            })
+    return out
+
+
+def _outpass_form_fields(html: str) -> tuple[str, str]:
+    soup = BeautifulSoup(html, "lxml")
+    csrf = soup.find("input", {"name": "_csrf"})
+    profile = soup.find("input", {"name": f"{_OP}[hostotpiid_profileid]"})
+    return (csrf.get("value", "") if csrf else ""), (profile.get("value", "") if profile else "")
+
+
+def _outpass_form_error(html: str) -> str | None:
+    if "has-error" not in html and "help-block-error" not in html:
+        return None
+    soup = BeautifulSoup(html, "lxml")
+    msgs = [b.get_text(" ", strip=True) for b in soup.select(".help-block-error") if b.get_text(strip=True)]
+    return " ".join(msgs) or "ERP validation failed. Check your timings or details."
+
+
+def _outpass_errors(tag: str):
+    def deco(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except HTTPException:
+                raise
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError) as net_err:
+                logger.error(f"[{tag}] ERP request failed: {net_err}")
+                raise HTTPException(status_code=502, detail="ERP request failed")
+            except Exception as e:
+                logger.error(f"[{tag}] Crash: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=str(e))
+        return wrapper
+    return deco
+
+
+@app.post("/fetch-outpass")
+@_outpass_errors("OUTPASS LIST")
+async def fetch_outpass(
+    username: str = Form(...),
+    password: str = Form(...),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
+    server_id: str = Form(default="erp1"),
+):
+    """All outpass requests, newest first as the ERP lists them."""
+    cookie_jar = _session_jar(php_sess_id, csrf_cookie, device_id, server_id)
+    async with make_erp_client() as client:
+        resp, cookie_jar = await _authed_get(client, URL_OUTPASS_LIST, cookie_jar, username, password)
+    return {
+        "success": True,
+        **_session_response(cookie_jar, php_sess_id, device_id, server_id, unquote(csrf_cookie) if csrf_cookie else ""),
+        "outpasses": _parse_outpass_list(resp.text),
+    }
+
+
+@app.post("/outpass-in-times")
+@_outpass_errors("OUTPASS INTIMES")
+async def outpass_in_times(
+    out_time: str = Form(...),
+    username: str = Form(...),
+    password: str = Form(...),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
+    server_id: str = Form(default="erp1"),
+):
+    """Allowed in-times for a given out-time (HH:MM:SS) on the local outpass form."""
+    if not _RE_TIME.match(out_time):
+        raise HTTPException(status_code=400, detail="out_time must be HH:MM:SS")
+    cookie_jar = _session_jar(php_sess_id, csrf_cookie, device_id, server_id)
+    async with make_erp_client() as client:
+        form, cookie_jar = await _authed_get(client, URL_OUTPASS_LOCAL, cookie_jar, username, password)
+        csrf, _ = _outpass_form_fields(form.text)
+        resp, cookie_jar = await _follow_redirects_collecting_cookies(
+            client, "POST", URL_OUTPASS_INTIME, cookie_jar, timeout=20,
+            data={"_csrf": csrf, "depdrop_parents[0]": out_time},
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": BASE_URL,
+                "Referer": URL_OUTPASS_LOCAL,
+            },
+        )
+        if is_login_failed(resp):
+            raise HTTPException(status_code=401, detail="ERP session expired. Please re-login.")
+        resp.raise_for_status()
+        data = resp.json()
+    return {
+        "success": True,
+        **_session_response(cookie_jar, php_sess_id, device_id, server_id, unquote(csrf_cookie) if csrf_cookie else ""),
+        "in_times": [item["id"] for item in data.get("output", []) if "id" in item],
+    }
+
+
+async def _submit_outpass(tag: str, form_url: str, build_payload, verify_key: str,
+                          username: str, password: str, php_sess_id: str, csrf_cookie: str,
+                          device_id: str, server_id: str, success_message: str):
+    """GET the form (auto-relogin), POST it once (never retried: it creates a request), verify on timeout."""
+    cookie_jar = _session_jar(php_sess_id, csrf_cookie, device_id, server_id)
+    async with make_erp_client() as client:
+        form, cookie_jar = await _authed_get(client, form_url, cookie_jar, username, password)
+        csrf, profile_id = _outpass_form_fields(form.text)
+        if not csrf:
+            raise HTTPException(status_code=502, detail="Failed to obtain CSRF token from ERP.")
+        if not profile_id:
+            raise HTTPException(status_code=404, detail="Hostel profile ID not found. Ensure you are enrolled in hostel management.")
+
+        payload = {"_csrf": csrf, f"{_OP}[hostotpiid_profileid]": profile_id, **build_payload()}
+        try:
+            resp, cookie_jar = await _follow_redirects_collecting_cookies(
+                client, "POST", form_url, cookie_jar, timeout=30, data=payload,
+                headers={"Origin": BASE_URL, "Referer": form_url},
+            )
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            logger.warning(f"[{tag}] timeout during submit for {username}: {exc}. Verifying against outpass list...")
+            try:
+                listing, cookie_jar = await _authed_get(client, URL_OUTPASS_LIST, cookie_jar, username, password)
+                for h in _parse_outpass_list(listing.text):
+                    if verify_key in h.get("outing_date", "") or verify_key in h.get("out_time", ""):
+                        return {"success": True, "verified_after_timeout": True,
+                                "message": f"Outpass found on ERP (status: {h['status']}); it went through before the timeout.",
+                                **_session_response(cookie_jar, php_sess_id, device_id, server_id, unquote(csrf_cookie) if csrf_cookie else "")}
+            except Exception as verr:
+                logger.error(f"[{tag}] verification failed: {verr}")
+            raise HTTPException(status_code=504, detail="ERP timed out during submission. Check your outpass history before retrying.")
+
+        if is_login_failed(resp):
+            raise HTTPException(status_code=401, detail="ERP session expired during submission. Nothing was submitted; please retry.")
+        err = _outpass_form_error(resp.text)
+        if err:
+            raise HTTPException(status_code=400, detail=err)
+    return {
+        "success": True,
+        "message": success_message,
+        **_session_response(cookie_jar, php_sess_id, device_id, server_id, unquote(csrf_cookie) if csrf_cookie else ""),
+    }
+
+
+@app.post("/apply-outpass-local")
+@_outpass_errors("OUTPASS LOCAL")
+async def apply_outpass_local(
+    date: str = Form(...),            # YYYY-MM-DD
+    out_time: str = Form(...),        # HH:MM:SS
+    in_time: str = Form(...),         # HH:MM:SS (from /outpass-in-times)
+    reason: str = Form(...),
+    breakfast: str = Form(default="NO"),
+    lunch: str = Form(default="NO"),
+    snack: str = Form(default="NO"),
+    dinner: str = Form(default="NO"),
+    username: str = Form(...),
+    password: str = Form(...),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
+    server_id: str = Form(default="erp1"),
+):
+    if not (_RE_DATE.match(date) and _RE_TIME.match(out_time) and _RE_TIME.match(in_time)):
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD and times HH:MM:SS")
+    reason = reason.strip()
+    if not reason or len(reason) > 250:
+        raise HTTPException(status_code=400, detail="reason is required (max 250 chars)")
+    yn = lambda v: "YES" if v.strip().upper() == "YES" else "NO"
+    return await _submit_outpass(
+        "OUTPASS LOCAL", URL_OUTPASS_LOCAL,
+        lambda: {
+            f"{_OP}[hostotpiid_date]": date,
+            f"{_OP}[hostotpiid_out_time]": out_time,
+            f"{_OP}[hostotpiid_in_time]": in_time,
+            f"{_OP}[hostotpiid_otpass_reason]": reason,
+            f"{_OP}[hostotpiid_brekfast_required]": yn(breakfast),
+            f"{_OP}[hostotpiid_lunch_required]": yn(lunch),
+            f"{_OP}[hostotpiid_snack_required]": yn(snack),
+            f"{_OP}[hostotpiid_dinner_required]": yn(dinner),
+        },
+        date, username, password, php_sess_id, csrf_cookie, device_id, server_id,
+        "Local outpass applied successfully! Waiting for warden approval.",
+    )
+
+
+@app.post("/apply-outpass-home")
+@_outpass_errors("OUTPASS HOME")
+async def apply_outpass_home(
+    out_datetime: str = Form(...),    # YYYY-MM-DD HH:MM:SS
+    in_datetime: str = Form(...),     # YYYY-MM-DD HH:MM:SS
+    reason: str = Form(...),
+    username: str = Form(...),
+    password: str = Form(...),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
+    server_id: str = Form(default="erp1"),
+):
+    if not (_RE_DATETIME.match(out_datetime) and _RE_DATETIME.match(in_datetime)):
+        raise HTTPException(status_code=400, detail="datetimes must be YYYY-MM-DD HH:MM:SS")
+    reason = reason.strip()
+    if not reason or len(reason) > 250:
+        raise HTTPException(status_code=400, detail="reason is required (max 250 chars)")
+    return await _submit_outpass(
+        "OUTPASS HOME", URL_OUTPASS_HOME,
+        lambda: {
+            f"{_OP}[hostotpiid_out_time]": out_datetime,
+            f"{_OP}[hostotpiid_in_time]": in_datetime,
+            f"{_OP}[hostotpiid_otpass_reason]": reason,
+        },
+        out_datetime.split()[0], username, password, php_sess_id, csrf_cookie, device_id, server_id,
+        "Home outpass applied successfully! Waiting for warden approval.",
+    )
+
+
 
 
 # ============================================================
