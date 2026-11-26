@@ -230,6 +230,15 @@ def health():
 
 
 # ------------------ UTILS ------------------
+def _safe_raise_for_status(response: httpx.Response):
+    """Like raise_for_status() but handles 302-to-login as 401 instead of crashing.
+    httpx 0.27+ raises HTTPStatusError on 3xx redirects."""
+    if response.status_code in (301, 302, 303) or is_login_failed(response):
+        raise HTTPException(status_code=401, detail="ERP session expired. Please re-login.")
+    if response.status_code >= 400:
+        response.raise_for_status()
+
+
 def is_login_failed(response: httpx.Response) -> bool:
     url_str = str(response.url)
     if "site%2Flogin" in url_str or "site/login" in url_str:
@@ -638,7 +647,7 @@ async def fetch_attendance_summary(
                     data=_make_payload(page_csrf)
                 )
 
-            post_response.raise_for_status()
+            _safe_raise_for_status(post_response)
             html_content = post_response.text
 
         table_match = re.search(r'<table.*?>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
@@ -787,7 +796,7 @@ async def fetch_register_details(
                 register_url_with_csrf = f"{register_url}&_csrf={active_csrf}"
                 response = await direct_client.get(register_url_with_csrf, cookies=cookie_jar, timeout=15)
 
-            response.raise_for_status()
+            _safe_raise_for_status(response)
             html_text = response.text
 
 
@@ -904,7 +913,7 @@ async def fetch_seating_plan(
 
                 response = await client.get(seating_plan_url, cookies=cookie_jar, timeout=15)
 
-            response.raise_for_status()
+            _safe_raise_for_status(response)
             html_content = response.text
 
         table_match = re.search(r'<table.*?>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
@@ -1018,7 +1027,7 @@ async def fetch_timetable(
 
                 response = await client.get(tt_url, cookies=cookie_jar, timeout=15)
 
-            response.raise_for_status()
+            _safe_raise_for_status(response)
             html_content = response.text
 
         table_match = re.search(r'<table.*?>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
@@ -1126,7 +1135,7 @@ async def fetch_cgpa_summary(
 
                 response = await client.get(cgpa_url, cookies=cookie_jar, timeout=15)
 
-            response.raise_for_status()
+            _safe_raise_for_status(response)
             html_content = response.text
 
         # Locate the core container table via regex
@@ -1248,7 +1257,7 @@ async def fetch_marks_detail(
                     cookie_jar["SERVERID"] = "erp1"
                 response = await direct_client.get(full_detail_url, cookies=cookie_jar, timeout=15)
 
-            response.raise_for_status()
+            _safe_raise_for_status(response)
             html_content = response.text
 
         # Extract rows using matching id markers.
@@ -1439,7 +1448,7 @@ async def fetch_internals(
                 else:
                     raise HTTPException(status_code=401, detail="Gateway authentication dropped permanently.")
                 page = await client.get(INTERNALS_URL, cookies=cookie_jar, timeout=15)
-            page.raise_for_status()
+            _safe_raise_for_status(page)
 
             csrf_token = extract_csrf(page.text)
             cookie_jar = collect_cookies(page, cookie_jar)
@@ -1449,7 +1458,7 @@ async def fetch_internals(
                 cookies=cookie_jar,
                 timeout=20,
             )
-            result.raise_for_status()
+            _safe_raise_for_status(result)
             courses = parse_internals_listing(result.text)
 
         if not courses:
@@ -1525,7 +1534,7 @@ async def fetch_internal_component(
                 response = await direct_client.get(full_url, cookies=cookie_jar, timeout=20)
             if response.status_code in (400, 404):
                 raise HTTPException(status_code=404, detail="Component link is stale. Call /fetch-internals again and use the new target_href.")
-            response.raise_for_status()
+            _safe_raise_for_status(response)
             parsed = parse_internal_component(response.text)
 
         updated_session_id = cookie_jar.get("PHPSESSID")
