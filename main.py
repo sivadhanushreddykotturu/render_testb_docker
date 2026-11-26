@@ -278,6 +278,7 @@ async def _follow_redirects_collecting_cookies(
     max_redirects = 10
 
     for _ in range(max_redirects):
+        client.cookies.clear()  # only send the explicit dict; a stale Set-Cookie in the jar would be sent first and PHP uses the first duplicate
         if method == "POST":
             resp = await client.post(
                 current_url, cookies=current_cookies,
@@ -770,16 +771,17 @@ async def fetch_register_details(
         else:
             active_csrf = unquote(csrf_cookie)
 
-        # Register fetch goes direct — gateway corrupts binary params in the URL
         async with httpx.AsyncClient(
             verify=False, headers=DEFAULT_HEADERS, http2=True,
             event_hooks={"response": [log_rate_limit]}
         ) as direct_client:
             register_url_with_csrf = f"{register_url}&_csrf={active_csrf}"
-            response = await direct_client.get(register_url_with_csrf, cookies=cookie_jar, timeout=15)
+            response, cookie_jar = await _follow_redirects_collecting_cookies(
+                direct_client, "GET", register_url_with_csrf, cookie_jar, timeout=15
+            )
 
-            if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
-                logger.warning("[LAZY-REGISTER] Session invalid. Auto-healing via gateway...")
+            if is_login_failed(response):
+                logger.warning("[LAZY-REGISTER] Session invalid. Auto-healing...")
                 async with make_erp_client() as gw_client:
                     for attempt in range(3):
                         if attempt > 0:
@@ -794,9 +796,14 @@ async def fetch_register_details(
                     cookie_jar["SERVERID"] = "erp1"
                 active_csrf = extract_csrf(login_response.text) or cookie_jar.get("_csrf", "")
                 register_url_with_csrf = f"{register_url}&_csrf={active_csrf}"
-                response = await direct_client.get(register_url_with_csrf, cookies=cookie_jar, timeout=15)
+                response, cookie_jar = await _follow_redirects_collecting_cookies(
+                    direct_client, "GET", register_url_with_csrf, cookie_jar, timeout=15
+                )
 
-            _safe_raise_for_status(response)
+            if is_login_failed(response):
+                raise HTTPException(status_code=401, detail="ERP session expired. Please re-login.")
+            if response.status_code >= 400:
+                response.raise_for_status()
             html_text = response.text
 
 
@@ -898,10 +905,12 @@ async def fetch_seating_plan(
                     raise HTTPException(status_code=401, detail="Cold-start login failed. Check credentials.")
                 php_sess_id = cookie_jar.get("PHPSESSID", "")
 
-            response = await client.get(seating_plan_url, cookies=cookie_jar, timeout=15)
+            response, cookie_jar = await _follow_redirects_collecting_cookies(
+                client, "GET", seating_plan_url, cookie_jar, timeout=15
+            )
 
-            if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
-                logger.warning("[SEATING] Session invalid or redirected (302). Executing tracking fallback...")
+            if is_login_failed(response):
+                logger.warning("[SEATING] Session invalid. Executing tracking fallback...")
                 for attempt in range(3):
                     if attempt > 0:
                         await asyncio.sleep(random.uniform(1.0, 2.0))
@@ -911,9 +920,14 @@ async def fetch_seating_plan(
                 else:
                     raise HTTPException(status_code=401, detail="ERP Session rejected.")
 
-                response = await client.get(seating_plan_url, cookies=cookie_jar, timeout=15)
+                response, cookie_jar = await _follow_redirects_collecting_cookies(
+                    client, "GET", seating_plan_url, cookie_jar, timeout=15
+                )
 
-            _safe_raise_for_status(response)
+            if is_login_failed(response):
+                raise HTTPException(status_code=401, detail="ERP session expired. Please re-login.")
+            if response.status_code >= 400:
+                response.raise_for_status()
             html_content = response.text
 
         table_match = re.search(r'<table.*?>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
@@ -1012,10 +1026,12 @@ async def fetch_timetable(
                     raise HTTPException(status_code=401, detail="Cold-start login failed. Check credentials.")
                 php_sess_id = cookie_jar.get("PHPSESSID", "")
 
-            response = await client.get(tt_url, cookies=cookie_jar, timeout=12)
+            response, cookie_jar = await _follow_redirects_collecting_cookies(
+                client, "GET", tt_url, cookie_jar, timeout=12
+            )
 
-            if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
-                logger.warning("[TIMETABLE] Session invalid or redirected (302). Executing automated auto-healing...")
+            if is_login_failed(response):
+                logger.warning("[TIMETABLE] Session invalid. Executing automated auto-healing...")
                 for attempt in range(3):
                     if attempt > 0:
                         await asyncio.sleep(random.uniform(1.0, 2.0))
@@ -1025,9 +1041,14 @@ async def fetch_timetable(
                 else:
                     raise HTTPException(status_code=401, detail="ERP credentials invalid.")
 
-                response = await client.get(tt_url, cookies=cookie_jar, timeout=15)
+                response, cookie_jar = await _follow_redirects_collecting_cookies(
+                    client, "GET", tt_url, cookie_jar, timeout=15
+                )
 
-            _safe_raise_for_status(response)
+            if is_login_failed(response):
+                raise HTTPException(status_code=401, detail="ERP session expired. Please re-login.")
+            if response.status_code >= 400:
+                response.raise_for_status()
             html_content = response.text
 
         table_match = re.search(r'<table.*?>(.*?)</table>', html_content, re.DOTALL | re.IGNORECASE)
@@ -1120,9 +1141,11 @@ async def fetch_cgpa_summary(
                     raise HTTPException(status_code=401, detail="Authentication initialization failed.")
                 php_sess_id = cookie_jar.get("PHPSESSID", "")
 
-            response = await client.get(cgpa_url, cookies=cookie_jar, timeout=15)
+            response, cookie_jar = await _follow_redirects_collecting_cookies(
+                client, "GET", cgpa_url, cookie_jar, timeout=15
+            )
 
-            if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
+            if is_login_failed(response):
                 logger.warning("[CGPA] Session handshake dropped. Executing auto-heal retry routine...")
                 for attempt in range(3):
                     if attempt > 0:
@@ -1133,9 +1156,14 @@ async def fetch_cgpa_summary(
                 else:
                     raise HTTPException(status_code=401, detail="Gateway authentication dropped permanently.")
 
-                response = await client.get(cgpa_url, cookies=cookie_jar, timeout=15)
+                response, cookie_jar = await _follow_redirects_collecting_cookies(
+                    client, "GET", cgpa_url, cookie_jar, timeout=15
+                )
 
-            _safe_raise_for_status(response)
+            if is_login_failed(response):
+                raise HTTPException(status_code=401, detail="ERP session expired. Please re-login.")
+            if response.status_code >= 400:
+                response.raise_for_status()
             html_content = response.text
 
         # Locate the core container table via regex
@@ -1239,10 +1267,12 @@ async def fetch_marks_detail(
             verify=False, headers=DEFAULT_HEADERS, http2=True,
             event_hooks={"response": [log_rate_limit]}
         ) as direct_client:
-            response = await direct_client.get(full_detail_url, cookies=cookie_jar, timeout=15)
+            response, cookie_jar = await _follow_redirects_collecting_cookies(
+                direct_client, "GET", full_detail_url, cookie_jar, timeout=15
+            )
 
-            if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
-                logger.warning("[MARKS DETAIL] Token expired. Launching auto-login fallback via gateway...")
+            if is_login_failed(response):
+                logger.warning("[MARKS DETAIL] Token expired. Launching auto-login fallback...")
                 async with make_erp_client() as gw_client:
                     for attempt in range(3):
                         if attempt > 0:
@@ -1255,9 +1285,14 @@ async def fetch_marks_detail(
 
                 if not cookie_jar.get("SERVERID"):
                     cookie_jar["SERVERID"] = "erp1"
-                response = await direct_client.get(full_detail_url, cookies=cookie_jar, timeout=15)
+                response, cookie_jar = await _follow_redirects_collecting_cookies(
+                    direct_client, "GET", full_detail_url, cookie_jar, timeout=15
+                )
 
-            _safe_raise_for_status(response)
+            if is_login_failed(response):
+                raise HTTPException(status_code=401, detail="ERP session expired. Please re-login.")
+            if response.status_code >= 400:
+                response.raise_for_status()
             html_content = response.text
 
         # Extract rows using matching id markers.
@@ -1437,8 +1472,10 @@ async def fetch_internals(
                 else:
                     raise HTTPException(status_code=401, detail="Authentication initialization failed.")
 
-            page = await client.get(INTERNALS_URL, cookies=cookie_jar, timeout=15)
-            if page.status_code in (301, 302, 303) or page.status_code == 500 or is_login_failed(page):
+            page, cookie_jar = await _follow_redirects_collecting_cookies(
+                client, "GET", INTERNALS_URL, cookie_jar, timeout=15
+            )
+            if is_login_failed(page):
                 for attempt in range(3):
                     if attempt > 0:
                         await asyncio.sleep(random.uniform(1.0, 2.0))
@@ -1447,16 +1484,18 @@ async def fetch_internals(
                         break
                 else:
                     raise HTTPException(status_code=401, detail="Gateway authentication dropped permanently.")
-                page = await client.get(INTERNALS_URL, cookies=cookie_jar, timeout=15)
-            _safe_raise_for_status(page)
+                page, cookie_jar = await _follow_redirects_collecting_cookies(
+                    client, "GET", INTERNALS_URL, cookie_jar, timeout=15
+                )
+            if is_login_failed(page):
+                raise HTTPException(status_code=401, detail="ERP session expired. Please re-login.")
+            if page.status_code >= 400:
+                page.raise_for_status()
 
             csrf_token = extract_csrf(page.text)
-            cookie_jar = collect_cookies(page, cookie_jar)
-            result = await client.post(
-                INTERNALS_URL,
+            result, cookie_jar = await _follow_redirects_collecting_cookies(
+                client, "POST", INTERNALS_URL, cookie_jar, timeout=20,
                 data={"_csrf": csrf_token, "DynamicModel[academicyear]": academic_year, "DynamicModel[semester]": semester},
-                cookies=cookie_jar,
-                timeout=20,
             )
             _safe_raise_for_status(result)
             courses = parse_internals_listing(result.text)
@@ -1518,8 +1557,10 @@ async def fetch_internal_component(
             verify=False, headers=DEFAULT_HEADERS, http2=True,
             event_hooks={"response": [log_rate_limit]}
         ) as direct_client:
-            response = await direct_client.get(full_url, cookies=cookie_jar, timeout=20)
-            if response.status_code in (301, 302, 303) or response.status_code == 500 or is_login_failed(response):
+            response, cookie_jar = await _follow_redirects_collecting_cookies(
+                direct_client, "GET", full_url, cookie_jar, timeout=20
+            )
+            if is_login_failed(response):
                 async with make_erp_client() as gw_client:
                     for attempt in range(3):
                         if attempt > 0:
@@ -1531,10 +1572,15 @@ async def fetch_internal_component(
                         raise HTTPException(status_code=401, detail="Session verification recovery rejected.")
                 if not cookie_jar.get("SERVERID"):
                     cookie_jar["SERVERID"] = "erp1"
-                response = await direct_client.get(full_url, cookies=cookie_jar, timeout=20)
+                response, cookie_jar = await _follow_redirects_collecting_cookies(
+                    direct_client, "GET", full_url, cookie_jar, timeout=20
+                )
             if response.status_code in (400, 404):
                 raise HTTPException(status_code=404, detail="Component link is stale. Call /fetch-internals again and use the new target_href.")
-            _safe_raise_for_status(response)
+            if is_login_failed(response):
+                raise HTTPException(status_code=401, detail="ERP session expired. Please re-login.")
+            if response.status_code >= 400:
+                response.raise_for_status()
             parsed = parse_internal_component(response.text)
 
         updated_session_id = cookie_jar.get("PHPSESSID")
