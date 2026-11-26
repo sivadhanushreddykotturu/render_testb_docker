@@ -1903,6 +1903,110 @@ async def apply_outpass_home(
     )
 
 
+# ============================================================
+# STUDENT PROFILE + HOSTEL STATUS (lets the app show outpass only to hostelers)
+# ============================================================
+URL_PROFILE = f"{BASE_URL}/index.php?r=studentinfo%2Fstudentprofileinfo%2Fviewprofileindi"
+
+
+def _parse_profile(html: str) -> dict:
+    """Only non-sensitive header fields; DOB, e-mail, blood group etc. are deliberately not returned."""
+    soup = BeautifulSoup(html, "lxml")
+    out = {"name": "", "university_id": "", "admission_date": "", "program": "", "regulation": ""}
+    head = soup.select_one("div.fs-5.fw-medium")
+    if head:
+        lines = [t.strip() for t in head.get_text("\n").split("\n") if t.strip()]
+        if lines:
+            out["name"] = lines[0]
+        for ln in lines[1:]:
+            m = re.search(r"University ID\s*:\s*(\S+)", ln)
+            if m:
+                out["university_id"] = m.group(1)
+    wanted = {"admission date": "admission_date", "program": "program", "regulation": "regulation"}
+    for tr in soup.select("div.text-start table tr"):
+        tds = tr.find_all("td")
+        if len(tds) >= 2:
+            key = tds[0].get_text(" ", strip=True).lower()
+            if key in wanted:
+                out[wanted[key]] = tds[1].get_text(" ", strip=True).lstrip(":").strip()
+    return out
+
+
+def _personal_tab(profile_html: str) -> tuple[str | None, str]:
+    """(URL of the 'Personal Information' tab, page csrf token). The tab is an AJAX POST whose id is encrypted by the ERP."""
+    soup = BeautifulSoup(profile_html, "lxml")
+    url = None
+    for btn in soup.find_all("button"):
+        if "personal information" in btn.get_text(" ", strip=True).lower() and btn.get("href"):
+            href = btn["href"].replace("&amp;", "&")
+            url = href if href.startswith("http") else f"{BASE_URL}{href}"
+            break
+    meta = soup.find("meta", {"name": "csrf-token"})
+    return url, (meta.get("content", "") if meta else "")
+
+
+_PERSONAL_FIELDS = {
+    "hostel status": "hostel_status",
+    "campus": "campus",
+    "major degree": "major_degree",
+    "admission type": "admission_type",
+    "current department :": "current_department",
+    "gender": "gender",
+}
+
+
+def _parse_personal_tab(html: str) -> dict:
+    """Only the fields the app needs; family names, caste, religion, identification marks etc. are not returned."""
+    soup = BeautifulSoup(html, "lxml")
+    out = {v: "" for v in _PERSONAL_FIELDS.values()}
+    for tr in soup.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) >= 2:
+            key = re.sub(r"\s+", " ", tds[0].get_text(" ", strip=True)).lower()
+            if key in _PERSONAL_FIELDS:
+                out[_PERSONAL_FIELDS[key]] = tds[1].get_text(" ", strip=True).lstrip(":").strip()
+    return out
+
+
+def _is_hosteller(status: str) -> bool:
+    return bool(re.search(r"\bhost(?:e)?l", status.lower()))
+
+
+@app.post("/fetch-profile")
+@_outpass_errors("PROFILE")
+async def fetch_profile(
+    username: str = Form(...),
+    password: str = Form(...),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
+    server_id: str = Form(default="erp1"),
+):
+    """Profile header + the ERP's own 'Hostel Status' field. is_hosteller drives whether the app shows outpass."""
+    cookie_jar = _session_jar(php_sess_id, csrf_cookie, device_id, server_id)
+    async with make_erp_client() as client:
+        prof, cookie_jar = await _authed_get(client, URL_PROFILE, cookie_jar, username, password)
+        tab_url, page_csrf = _personal_tab(prof.text)
+        if not tab_url:
+            raise HTTPException(status_code=502, detail="Could not find the Personal Information tab on the ERP profile page.")
+        tab, cookie_jar = await _follow_redirects_collecting_cookies(
+            client, "POST", tab_url, cookie_jar, timeout=20,
+            headers={"X-Requested-With": "XMLHttpRequest", "X-CSRF-Token": page_csrf, "Origin": BASE_URL, "Referer": URL_PROFILE},
+        )
+        if is_login_failed(tab):
+            raise HTTPException(status_code=401, detail="ERP session expired. Please re-login.")
+        tab.raise_for_status()
+    personal = _parse_personal_tab(tab.text)
+    if not personal["hostel_status"]:
+        raise HTTPException(status_code=502, detail="Hostel Status field not found on the ERP profile.")
+    return {
+        "success": True,
+        **_session_response(cookie_jar, php_sess_id, device_id, server_id, unquote(csrf_cookie) if csrf_cookie else ""),
+        "profile": {**_parse_profile(prof.text), **{k: v for k, v in personal.items() if k != "hostel_status"}},
+        "hostel": {"status": personal["hostel_status"], "is_hosteller": _is_hosteller(personal["hostel_status"])},
+    }
+
+
 
 
 # ============================================================
