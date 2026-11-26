@@ -27,28 +27,7 @@ import secrets
 import datetime
 import functools
 from bs4 import BeautifulSoup
-import sqlite3
 
-# ------------------ DATA FLYWHEEL INIT ------------------
-DATASET_DIR = "dataset"
-IMAGES_DIR = os.path.join(DATASET_DIR, "images")
-DB_PATH = os.path.join(DATASET_DIR, "captchas.db")
-
-os.makedirs(IMAGES_DIR, exist_ok=True)
-
-try:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS captchas (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                image_hash TEXT UNIQUE,
-                text_label TEXT,
-                filename TEXT,
-                created_at DATETIME
-            )
-        """)
-except Exception as e:
-    pass  # Rely on basic logging below if needed, or silently continue if DB init fails locally
 
 class GatewayRequestError(Exception):
     pass
@@ -249,24 +228,6 @@ def health():
         "status": "healthy",
     }
 
-# ------------------ DATA FLYWHEEL STATS ------------------
-@app.get("/flywheel-stats")
-def get_flywheel_stats():
-    """Secure endpoint to check how many CAPTCHAs have been collected.
-    Returns only the total count to protect privacy and dataset security."""
-    try:
-        with sqlite3.connect(DB_PATH, timeout=5.0) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM captchas")
-            count = cursor.fetchone()[0]
-        return {
-            "success": True,
-            "total_collected": count,
-            "message": "Data Flywheel is actively deduplicating and collecting."
-        }
-    except Exception as e:
-        logger.error(f"[FLYWHEEL] Stats endpoint error: {e}")
-        return JSONResponse(status_code=500, content={"success": False, "detail": "Stats unavailable at the moment."})
 
 # ------------------ UTILS ------------------
 def is_login_failed(response: httpx.Response) -> bool:
@@ -459,28 +420,6 @@ async def _login_once(client: httpx.AsyncClient, username: str, password: str, a
     return response, final_cookies, captcha_text, cap.content
 
 
-def _save_verified_captcha(captcha_text: str, captcha_bytes: bytes):
-    if os.environ.get("CAPTCHA_FLYWHEEL", "0") != "1":
-        return
-
-    def _bg():
-        try:
-            img_hash = hashlib.md5(captcha_bytes).hexdigest()
-            filename = f"{captcha_text}_{img_hash}.png"
-            timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            with sqlite3.connect(DB_PATH, timeout=5.0) as conn:
-                conn.execute(
-                    "INSERT INTO captchas (image_hash, text_label, filename, created_at) VALUES (?, ?, ?, ?)",
-                    (img_hash, captcha_text, filename, timestamp)
-                )
-            with open(os.path.join(IMAGES_DIR, filename), "wb") as f:
-                f.write(captcha_bytes)
-        except sqlite3.IntegrityError:
-            pass
-        except Exception as e:
-            logger.error(f"[FLYWHEEL] Error saving dataset: {e}")
-
-    threading.Thread(target=_bg, daemon=True).start()
 
 
 async def _login_worker(username: str, password: str) -> tuple[httpx.Response, dict]:
@@ -489,7 +428,6 @@ async def _login_worker(username: str, password: str) -> tuple[httpx.Response, d
             for attempt in range(1, LOGIN_MAX_CAPTCHA_ATTEMPTS + 1):
                 response, cookies, captcha_text, captcha_bytes = await _login_once(client, username, password, attempt)
                 if not is_login_failed(response):
-                    _save_verified_captcha(captcha_text, captcha_bytes)
                     return response, cookies
 
                 blocks = " ".join(
@@ -594,7 +532,7 @@ async def login(username: str = Form(...), password: str = Form(...)):
             }
     except HTTPException:
         raise
-    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError, GatewayUnavailableError) as net_err:
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError) as net_err:
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         logger.error(f"[NETWORK REJECTION] /login - University gateway down: {net_err}")
@@ -759,7 +697,7 @@ async def fetch_attendance_summary(
         }
     except HTTPException:
         raise
-    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError, GatewayUnavailableError) as net_err:
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError) as net_err:
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         logger.error(f"[NETWORK REJECTION] /fetch-attendance - University gateway down: {net_err}")
@@ -908,7 +846,7 @@ async def fetch_register_details(
         }
     except HTTPException:
         raise
-    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError, GatewayUnavailableError) as net_err:
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError) as net_err:
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         logger.error(f"[NETWORK REJECTION] /fetch-register-detail - University gateway down: {net_err}")
@@ -1015,7 +953,7 @@ async def fetch_seating_plan(
         }
     except HTTPException:
         raise
-    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError, GatewayUnavailableError) as net_err:
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError) as net_err:
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         logger.error(f"[NETWORK REJECTION] /fetch-seating-plan - University gateway down: {net_err}")
@@ -1130,7 +1068,7 @@ async def fetch_timetable(
         }
     except HTTPException:
         raise
-    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError, GatewayUnavailableError) as net_err:
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError) as net_err:
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         logger.error(f"[NETWORK REJECTION] /fetch-timetable - University gateway down: {net_err}")
@@ -1249,7 +1187,7 @@ async def fetch_cgpa_summary(
 
     except HTTPException:
         raise
-    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError, GatewayUnavailableError) as net_err:
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError) as net_err:
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         logger.error(f"[NETWORK REJECTION] /fetch-cgpa - University gateway down: {net_err}")
@@ -1364,7 +1302,7 @@ async def fetch_marks_detail(
 
     except HTTPException:
         raise
-    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError, GatewayUnavailableError) as net_err:
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError) as net_err:
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         logger.error(f"[NETWORK REJECTION] /fetch-marks-detail - University gateway down: {net_err}")
@@ -1536,7 +1474,7 @@ async def fetch_internals(
         }
     except HTTPException:
         raise
-    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError, GatewayUnavailableError) as net_err:
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError) as net_err:
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         raise HTTPException(status_code=502, detail="ERP request failed")
@@ -1607,7 +1545,7 @@ async def fetch_internal_component(
         }
     except HTTPException:
         raise
-    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError, GatewayUnavailableError) as net_err:
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError) as net_err:
         if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
             raise
         raise HTTPException(status_code=502, detail="ERP request failed")
@@ -1616,287 +1554,6 @@ async def fetch_internal_component(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ============================================================
-# AUTO-FEEDBACK SUBMISSION (personal use only)
-# ============================================================
-
-FEEDBACK_ALLOWED_USERS = os.environ.get("FEEDBACK_ALLOWED_USERS", "2400032717").split(",")
-
-FEEDBACK_LISTING_URL = f"{BASE_URL}/index.php?r=feedback%2Ffeedbackstudentresultinfo%2Fcreatestudentfeedback"
-FEEDBACK_SUBMIT_URL = f"{BASE_URL}/index.php?r=feedback%2Ffeedbackstudentresultinfo%2Fsavestudentfeedback"
-
-
-def _parse_feedback_form(form_html: str):
-    """
-    Parse a Yii2 feedback form page.
-    Returns (csrf, payload_tuples, course_desc, faculty_name, question_count)
-    where payload_tuples is a list of (name, value) ready to POST.
-    """
-    # Extract CSRF from the form's hidden input
-    form_csrf = ""
-    csrf_m = re.search(r'<input[^>]+name=["\']_csrf["\'][^>]+value=["\']([^"\']+)["\']', form_html)
-    if csrf_m:
-        form_csrf = csrf_m.group(1)
-    if not form_csrf:
-        csrf_m = re.search(r'<input[^>]+value=["\']([^"\']+)["\'][^>]+name=["\']_csrf["\']', form_html)
-        if csrf_m:
-            form_csrf = csrf_m.group(1)
-
-    # Find all <input> tags
-    all_inputs = re.findall(r'<input[^>]+>', form_html, re.IGNORECASE)
-
-    hidden_fields = []       # (name, value) for all hidden inputs except _csrf and DynamicModel answers
-    question_ids = {}        # {index_str: qid}
-    course_desc = ""
-
-    for inp in all_inputs:
-        is_hidden = ('type="hidden"' in inp or "type='hidden'" in inp)
-        if not is_hidden:
-            continue
-
-        name_m = re.search(r'name=["\']([^"\']+)["\']', inp)
-        if not name_m:
-            continue
-        name = name_m.group(1)
-
-        value_m = re.search(r'value=["\']([^"\']*)["\']', inp)
-        value = value_m.group(1) if value_m else ""
-
-        # Skip _csrf (added separately)
-        if name == "_csrf":
-            continue
-
-        # Track questionnaire IDs
-        qid_m = re.match(r'FeedbackStudentResultInfo\[(\d+)\]\[fsri_student_questionaire_info_id\]', name)
-        if qid_m:
-            question_ids[qid_m.group(1)] = value
-
-        # Track course description for logging
-        if "fsri_course_desc" in name and not course_desc:
-            course_desc = value
-
-        # Skip DynamicModel answer hidden (we'll build our own)
-        if "DynamicModel" in name and "answer_option" in name:
-            continue
-
-        hidden_fields.append((name, value))
-
-    # Build final payload as ordered list of tuples (duplicate keys OK)
-    payload = [("_csrf", form_csrf)]
-    # We need to interleave the hidden fields and answer options in correct index order
-    # Group hidden fields by question index
-    max_idx = max((int(k) for k in question_ids), default=-1)
-
-    for idx in range(max_idx + 1):
-        idx_str = str(idx)
-        qid = question_ids.get(idx_str, "")
-
-        # Add all FeedbackStudentResultInfo[idx][...] hidden fields for this index
-        # They come before the answer in the form, so add profile_id first
-        for name, value in hidden_fields:
-            if f"[{idx_str}]" in name:
-                payload.append((name, value))
-                # Insert the DynamicModel answer right after the questionaire_info_id
-                if "fsri_student_questionaire_info_id" in name and qid:
-                    answer_key = f"DynamicModel[{idx_str}][fsri_student_questionaire_answer_option]"
-                    payload.append((answer_key, ""))        # Yii hidden (empty)
-                    payload.append((answer_key, f"{qid}:::1"))  # Option 1 = best
-
-    return form_csrf, payload, course_desc, len(question_ids)
-
-
-@app.post("/auto-feedback")
-@with_gateway_retries(max_retries=3)
-async def auto_feedback(
-    username: str = Form(...),
-    password: str = Form(...),
-    php_sess_id: str = Form(default=""),
-    csrf_cookie: str = Form(default=""),
-    device_id: str = Form(default=""),
-    server_id: str = Form(default="erp3"),
-):
-    if username not in FEEDBACK_ALLOWED_USERS:
-        raise HTTPException(status_code=403, detail="Auto-feedback is not enabled for this account.")
-
-    start_time = time.time()
-    cookie_jar = {
-        "_csrf": unquote(csrf_cookie) if csrf_cookie else "",
-        "PHPSESSID": php_sess_id,
-        "kl_erp_device_id": unquote(device_id) if device_id else "",
-        "SERVERID": server_id
-    }
-
-    try:
-        async with make_erp_client() as client:
-
-            # ---------- Step 0: login if no session ----------
-            if not php_sess_id or not csrf_cookie:
-                for attempt in range(3):
-                    if attempt > 0:
-                        await asyncio.sleep(random.uniform(1.0, 2.5))
-                    login_resp, cookie_jar = await auto_login(client, username, password, seed_cookies={})
-                    if not is_login_failed(login_resp):
-                        break
-                    logger.warning(f"[FEEDBACK] Login attempt {attempt+1} failed.")
-                else:
-                    raise HTTPException(status_code=401, detail="Login failed.")
-
-            # ---------- Step 1: GET feedback listing page ----------
-            listing_resp, cookie_jar = await _follow_redirects_collecting_cookies(
-                client, "GET", FEEDBACK_LISTING_URL, cookie_jar, timeout=20
-            )
-
-            # Auto-heal if session expired
-            if is_login_failed(listing_resp):
-                logger.info("[FEEDBACK] Session expired, re-authenticating...")
-                for attempt in range(3):
-                    if attempt > 0:
-                        await asyncio.sleep(random.uniform(1.0, 2.5))
-                    login_resp, cookie_jar = await auto_login(client, username, password, seed_cookies=cookie_jar)
-                    if not is_login_failed(login_resp):
-                        break
-                else:
-                    raise HTTPException(status_code=401, detail="Session recovery failed.")
-                listing_resp, cookie_jar = await _follow_redirects_collecting_cookies(
-                    client, "GET", FEEDBACK_LISTING_URL, cookie_jar, timeout=20
-                )
-
-            listing_html = listing_resp.text
-
-            # ---------- Step 2: parse all feedback links ----------
-            # Links look like: <a class="crudjax2" href="/index.php?r=...&amp;id=...">Faculty Name</a>
-            link_matches = re.findall(
-                r'<a[^>]*class=["\']crudjax2["\'][^>]*href=["\']([^"\']+)["\'][^>]*>\s*(.*?)\s*</a>',
-                listing_html, re.IGNORECASE | re.DOTALL
-            )
-
-            if not link_matches:
-                elapsed = round(time.time() - start_time, 2)
-                return {
-                    "success": True,
-                    "message": "No pending feedback found.",
-                    "submitted": [],
-                    "failed": [],
-                    "elapsed_seconds": elapsed
-                }
-
-            # Deduplicate by href
-            seen_hrefs = set()
-            unique_entries = []
-            for href_raw, faculty_name in link_matches:
-                href_clean = href_raw.replace("&amp;", "&")
-                if href_clean not in seen_hrefs:
-                    seen_hrefs.add(href_clean)
-                    faculty_clean = re.sub(r'<[^>]*>', '', faculty_name).strip()
-                    faculty_clean = re.sub(r'\s+', ' ', faculty_clean)
-                    unique_entries.append((href_clean, faculty_clean))
-
-            logger.info(f"[FEEDBACK] Found {len(unique_entries)} pending feedback(s) to submit.")
-
-            # ---------- Step 3: submit each one ----------
-            submitted = []
-            failed = []
-
-            for href, faculty in unique_entries:
-                form_url = f"{BASE_URL}{href}" if href.startswith("/") else href
-
-                try:
-                    # Fresh HTTP/1.1 client per feedback (avoids H2 stream state issues)
-                    async with make_erp_client(
-                        http2=False, follow_redirects=True, timeout=20
-                    ) as fc:
-                        # GET the feedback form page
-                        form_resp = await fc.get(form_url, cookies=cookie_jar)
-                        cookie_jar = collect_cookies(form_resp, cookie_jar)
-
-                        if is_login_failed(form_resp):
-                            for attempt in range(3):
-                                if attempt > 0:
-                                    await asyncio.sleep(random.uniform(1.0, 2.5))
-                                login_resp, cookie_jar = await auto_login(fc, username, password, seed_cookies=cookie_jar)
-                                if not is_login_failed(login_resp):
-                                    break
-                            form_resp = await fc.get(form_url, cookies=cookie_jar)
-                            cookie_jar = collect_cookies(form_resp, cookie_jar)
-
-                        form_html = form_resp.text
-
-                        # Check if form exists
-                        if "studentfeedbackform" not in form_html:
-                            failed.append({"faculty": faculty, "error": "Feedback form not found on page (already submitted?)"})
-                            continue
-
-                        # Parse the form
-                        form_csrf, payload, course_desc, q_count = _parse_feedback_form(form_html)
-
-                        if not form_csrf:
-                            failed.append({"faculty": faculty, "course": course_desc, "error": "CSRF token not found"})
-                            continue
-
-                        if q_count == 0:
-                            failed.append({"faculty": faculty, "course": course_desc, "error": "No questions found in form"})
-                            continue
-
-                        # POST the feedback (don't follow redirect, 302 = success)
-                        # Manually URL-encode to avoid httpx sync stream bug with data=list_of_tuples
-                        from urllib.parse import urlencode as _urlencode
-                        encoded_body = _urlencode(payload)
-                        submit_resp = await fc.post(
-                            FEEDBACK_SUBMIT_URL,
-                            cookies=cookie_jar,
-                            content=encoded_body.encode("utf-8"),
-                            headers={
-                                "Content-Type": "application/x-www-form-urlencoded",
-                                "Origin": BASE_URL,
-                                "Referer": form_url,
-                            },
-                            follow_redirects=False,
-                        )
-                        cookie_jar = collect_cookies(submit_resp, cookie_jar)
-
-                        # Yii returns 302 after successful save
-                        if submit_resp.status_code in (200, 302):
-                            submitted.append({
-                                "faculty": faculty,
-                                "course": course_desc,
-                                "questions": q_count,
-                                "status": "submitted"
-                            })
-                            logger.info(f"[FEEDBACK] ✅ {course_desc} — {faculty} ({q_count} questions)")
-                        else:
-                            failed.append({
-                                "faculty": faculty,
-                                "course": course_desc,
-                                "error": f"Submit returned status {submit_resp.status_code}"
-                            })
-                            logger.warning(f"[FEEDBACK] ❌ {course_desc} — {faculty}: HTTP {submit_resp.status_code}")
-
-                    # Small delay between submissions
-                    await asyncio.sleep(random.uniform(0.3, 0.8))
-
-                except Exception as e:
-                    failed.append({"faculty": faculty, "error": str(e)})
-                    logger.error(f"[FEEDBACK] Error for {faculty}: {e}", exc_info=True)
-
-            elapsed = round(time.time() - start_time, 2)
-            return {
-                "success": True,
-                "total_found": len(unique_entries),
-                "submitted": submitted,
-                "failed": failed,
-                "elapsed_seconds": elapsed
-            }
-
-    except HTTPException:
-        raise
-    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError, httpx.TimeoutException, httpx.ProxyError, httpx.HTTPStatusError, GatewayUnavailableError) as net_err:
-        if isinstance(net_err, httpx.HTTPStatusError) and net_err.response.status_code not in (502, 503):
-            raise
-        logger.error(f"[NETWORK] /auto-feedback - ERP unreachable: {net_err}")
-        raise HTTPException(status_code=502, detail="ERP request failed")
-    except Exception as e:
-        logger.error(f"[FEEDBACK] Crash: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============================================================
