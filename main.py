@@ -2007,6 +2007,208 @@ async def fetch_profile(
     }
 
 
+# ============================================================
+# COURSE HANDOUTS: list for a semester + one handout's detail
+# ============================================================
+URL_HANDOUTS_PAGE = f"{BASE_URL}/index.php?r=studentinfo%2Fstudentcoursemappingmasterinfoview%2Fgetstudentcourseshandouts"
+URL_HANDOUTS_LIST = URL_HANDOUTS_PAGE + "byid"
+
+_HANDOUT_FIELDS = {
+    "course title": "title",
+    "course code": "code",
+    "l-t-p-s structure": "ltps",
+    "pre-requisite": "prerequisite",
+    "credits": "credits",
+    "course coordinator": "coordinator",
+    "team of instructors": "instructors",
+    "syllabus": "syllabus",
+}
+_PLAN_END = r"(?=<br>\s*<p><b>\s*(?:Lecture|Tutorial|Practical|Skilling)\s+Session wise|\Z)"
+
+
+def _clean(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _parse_handout_list(html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "lxml")
+    out = []
+    for tr in soup.select("tbody tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 6:
+            continue
+        link = tr.find("a", title="Handout")
+        out.append({
+            "sno": _clean(tds[0].get_text()),
+            "course_code": _clean(tds[1].get_text()),
+            "course_name": _clean(tds[2].get_text()),
+            "offering_year": _clean(tds[3].get_text()),
+            "semester": _clean(tds[4].get_text()),
+            "offered_by": _clean(tds[5].get_text()),
+            "target_href": link["href"] if link is not None and link.get("href") else "",
+        })
+    return out
+
+
+def _table_rows(table) -> tuple[list[str], list[list[str]]]:
+    """A table's OWN header and rows only (the handout nests tables inside each other)."""
+    thead = table.find("thead", recursive=False)
+    heads = [_clean(th.get_text(" ")) for th in thead.find_all("th")] if thead else []
+    rows = []
+    for section in [table, *table.find_all("tbody", recursive=False)]:
+        for tr in section.find_all("tr", recursive=False):
+            tds = tr.find_all("td", recursive=False)
+            if tds:
+                rows.append([_clean(td.get_text(" ")) for td in tds])
+    return heads, rows
+
+
+def _parse_handout(html: str) -> dict:
+    """The ERP's handout page is badly nested HTML, so each section is read on its own."""
+    soup = BeautifulSoup(html, "lxml")
+    out = {"department": "", "term": "", **{v: "" for v in _HANDOUT_FIELDS.values()}}
+
+    head = soup.select_one("th.course-handout")
+    if head:
+        lines = [_clean(t) for t in head.get_text("\n").split("\n") if _clean(t)]
+        out["department"] = lines[0] if lines else ""
+        out["term"] = lines[-1] if len(lines) > 2 else ""
+
+    for tr in soup.find_all("tr"):
+        tds = tr.find_all("td", recursive=False)
+        if len(tds) != 2:
+            continue
+        key = _clean(tds[0].get_text(" ")).rstrip(":").strip().lower()
+        field = _HANDOUT_FIELDS.get(key)
+        if field and not out[field]:
+            out[field] = _clean(tds[1].get_text(" ")).lstrip(":").strip()
+    out["instructors"] = [n for n in (_clean(x) for x in out["instructors"].split(",")) if n]
+
+    outcomes, faculty = [], []
+    for table in soup.find_all("table"):
+        heads = [h.lower() for h in _table_rows(table)[0]]
+        if heads[:1] == ["co no"]:
+            for row in _table_rows(table)[1]:
+                if len(row) >= 4:
+                    outcomes.append({"co": row[0], "outcome": row[1], "po": row[2], "btl": row[3]})
+        elif heads[:1] == ["name of faculty"]:
+            for row in _table_rows(table)[1]:
+                if len(row) >= 3:
+                    faculty.append({"name": row[0], "component": row[1], "sections": row[2]})
+    out["outcomes"] = outcomes
+    out["faculty"] = faculty
+
+    plans = []
+    for m in re.finditer(r"<b>\s*(Lecture|Tutorial|Practical|Skilling)\s+Course DELIVERY Plan:\s*</b>(.*?)" + _PLAN_END, html, re.S):
+        kind, seg = m.group(1), m.group(2)
+        table = BeautifulSoup(seg, "lxml").find("table") if "<table" in seg else None
+        if table is None:
+            continue
+        heads, rows = _table_rows(table)
+        if rows:
+            plans.append({"kind": kind, "columns": heads, "rows": rows})
+    out["plans"] = plans
+
+    evaluation = []
+    idx = html.find("<b>Evaluation Type</b>")
+    if idx != -1:
+        start, end = html.rfind("<table", 0, idx), html.find("</table>", idx)
+        if start != -1 and end != -1:
+            table = BeautifulSoup(html[start:end + 8], "lxml")
+            current = None
+            group_type, group_total = "", ""
+            for tr in table.find_all("tr"):
+                cells = [_clean(td.get_text(" ")) for td in tr.find_all("td", recursive=False)]
+                if "Weightage" in cells:
+                    i = cells.index("Weightage")
+                    # the type cell is shared by every component of its group, so only the group's first row has it
+                    if i >= 2:
+                        group_type = _clean(re.split(r"Total\s*=", cells[0])[0])
+                        total = re.search(r"Total\s*=\s*(\d+)", cells[0])
+                        group_total = total.group(1) if total else ""
+                    current = {
+                        "type": group_type,
+                        "total_percent": group_total,
+                        "component": cells[i - 1] if i >= 1 else "",
+                        "weightage": cells[i + 1] if len(cells) > i + 1 else "",
+                        "date": cells[i + 2] if len(cells) > i + 2 else "",
+                        "duration": cells[i + 3] if len(cells) > i + 3 else "",
+                        "max_marks": "",
+                    }
+                    evaluation.append(current)
+                elif cells and cells[0] == "Max Marks" and current and len(cells) > 1:
+                    current["max_marks"] = cells[1]
+    out["evaluation"] = evaluation
+    return out
+
+
+@app.post("/fetch-handouts")
+@_outpass_errors("HANDOUTS")
+async def fetch_handouts(
+    username: str = Form(...),
+    password: str = Form(...),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
+    server_id: str = Form(default="erp1"),
+    academic_year_code: str = Form(default="29"),
+    semester_id: str = Form(default="1"),
+):
+    """The semester's courses, each with the link to its handout."""
+    if not (re.fullmatch(r"\d{1,3}", academic_year_code) and re.fullmatch(r"\d{1,2}", semester_id)):
+        raise HTTPException(status_code=400, detail="Invalid academic year or semester.")
+    cookie_jar = _session_jar(php_sess_id, csrf_cookie, device_id, server_id)
+    async with make_erp_client() as client:
+        page, cookie_jar = await _authed_get(client, URL_HANDOUTS_PAGE, cookie_jar, username, password)
+        soup = BeautifulSoup(page.text, "lxml")
+        meta = soup.find("meta", {"name": "csrf-token"})
+        field = soup.find("input", {"name": "_csrf"})
+        token = (meta.get("content", "") if meta else "") or (field.get("value", "") if field else "")
+        if not token:
+            raise HTTPException(status_code=502, detail="Could not read the ERP handouts page.")
+        resp, cookie_jar = await _follow_redirects_collecting_cookies(
+            client, "POST", URL_HANDOUTS_LIST, cookie_jar, timeout=30,
+            data={"_csrf": token, "DynamicModel[academicyear]": academic_year_code, "DynamicModel[semester]": semester_id},
+            headers={"X-Requested-With": "XMLHttpRequest", "X-CSRF-Token": token, "Referer": URL_HANDOUTS_PAGE, "Origin": BASE_URL},
+        )
+        if is_login_failed(resp):
+            raise HTTPException(status_code=401, detail="ERP session expired. Please re-login.")
+        resp.raise_for_status()
+    return {
+        "success": True,
+        **_session_response(cookie_jar, php_sess_id, device_id, server_id, unquote(csrf_cookie) if csrf_cookie else ""),
+        "courses": _parse_handout_list(resp.text),
+    }
+
+
+@app.post("/fetch-handout-detail")
+@_outpass_errors("HANDOUT DETAIL")
+async def fetch_handout_detail(
+    target_href: str = Form(...),
+    username: str = Form(...),
+    password: str = Form(...),
+    php_sess_id: str = Form(default=""),
+    csrf_cookie: str = Form(default=""),
+    device_id: str = Form(default=""),
+    server_id: str = Form(default="erp1"),
+):
+    """One handout, parsed. target_href is exactly the link /fetch-handouts returned."""
+    url = target_href if target_href.startswith("http") else f"{BASE_URL}{target_href}"
+    if not url.startswith(BASE_URL) or "viewhandout" not in url:
+        raise HTTPException(status_code=400, detail="Not a handout link.")
+    cookie_jar = _session_jar(php_sess_id, csrf_cookie, device_id, server_id)
+    async with make_erp_client() as client:
+        resp, cookie_jar = await _authed_get(client, url, cookie_jar, username, password)
+    handout = _parse_handout(resp.text)
+    if not handout["title"]:
+        raise HTTPException(status_code=404, detail="Handout not found. Refresh the list and try again.")
+    return {
+        "success": True,
+        **_session_response(cookie_jar, php_sess_id, device_id, server_id, unquote(csrf_cookie) if csrf_cookie else ""),
+        "handout": handout,
+    }
+
+
 
 
 # ============================================================
