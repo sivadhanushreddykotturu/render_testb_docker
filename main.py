@@ -1788,12 +1788,42 @@ async def outpass_in_times(
     }
 
 
-async def _submit_outpass(tag: str, form_url: str, build_payload, verify_key: str,
+def _page_notices(html: str) -> str:
+    """The ERP's own error / warning messages on a page, if it shows any."""
+    soup = BeautifulSoup(html, "lxml")
+    msgs: list[str] = []
+    for el in soup.select(".alert-danger, .alert-warning, .alert-error, .alert-info, .help-block-error, .has-error .help-block"):
+        text = re.sub(r"^[×x]\s*", "", re.sub(r"\s+", " ", el.get_text(" ")).strip())
+        if text and text not in msgs:
+            msgs.append(text)
+    # this ERP shows most messages as toastr pop-ups written into the page's script
+    for m in re.finditer(r"toastr\.(?:error|warning)\(\s*(['\"])(.*?)\1", html, re.S):
+        text = re.sub(r"\s+", " ", BeautifulSoup(m.group(2), "lxml").get_text(" ")).strip()
+        if text and text not in msgs:
+            msgs.append(text)
+    return " ".join(msgs)
+
+
+def _find_created(rows: list[dict], known: set, reason: str) -> dict | None:
+    """The request that was not in the list before we submitted and carries the reason we sent.
+    Matched by id + reason, not by times: the ERP can move a date (a past out-time today becomes tomorrow)."""
+    wanted = re.sub(r"\s+", " ", reason).strip().lower()
+    for row in rows:
+        if row["id"] not in known and re.sub(r"\s+", " ", row.get("reason", "")).strip().lower() == wanted:
+            return row
+    return None
+
+
+async def _submit_outpass(tag: str, form_url: str, build_payload, reason: str, expected_out: str,
                           username: str, password: str, php_sess_id: str, csrf_cookie: str,
                           device_id: str, server_id: str, success_message: str):
-    """GET the form (auto-relogin), POST it once (never retried: it creates a request), verify on timeout."""
+    """List the requests, GET the form (auto-relogin), POST it once (never retried: it creates a request),
+    then confirm the new request really is in the ERP list. expected_out ("YYYY-MM-DD HH:MM") only feeds a note if the ERP moved it."""
     cookie_jar = _session_jar(php_sess_id, csrf_cookie, device_id, server_id)
     async with make_erp_client() as client:
+        before, cookie_jar = await _authed_get(client, URL_OUTPASS_LIST, cookie_jar, username, password)
+        known = {r["id"] for r in _parse_outpass_list(before.text)}
+
         form, cookie_jar = await _authed_get(client, form_url, cookie_jar, username, password)
         csrf, profile_id = _outpass_form_fields(form.text)
         if not csrf:
@@ -1811,11 +1841,11 @@ async def _submit_outpass(tag: str, form_url: str, build_payload, verify_key: st
             logger.warning(f"[{tag}] timeout during submit for {username}: {exc}. Verifying against outpass list...")
             try:
                 listing, cookie_jar = await _authed_get(client, URL_OUTPASS_LIST, cookie_jar, username, password)
-                for h in _parse_outpass_list(listing.text):
-                    if verify_key in h.get("outing_date", "") or verify_key in h.get("out_time", ""):
-                        return {"success": True, "verified_after_timeout": True,
-                                "message": f"Outpass found on ERP (status: {h['status']}); it went through before the timeout.",
-                                **_session_response(cookie_jar, php_sess_id, device_id, server_id, unquote(csrf_cookie) if csrf_cookie else "")}
+                created = _find_created(_parse_outpass_list(listing.text), known, reason)
+                if created:
+                    return {"success": True, "verified_after_timeout": True, "outpass": created,
+                            "message": f"Outpass found on ERP (status: {created['status']}); it went through before the timeout.",
+                            **_session_response(cookie_jar, php_sess_id, device_id, server_id, unquote(csrf_cookie) if csrf_cookie else "")}
             except Exception as verr:
                 logger.error(f"[{tag}] verification failed: {verr}")
             raise HTTPException(status_code=504, detail="ERP timed out during submission. Check your outpass history before retrying.")
@@ -1825,9 +1855,28 @@ async def _submit_outpass(tag: str, form_url: str, build_payload, verify_key: st
         err = _outpass_form_error(resp.text)
         if err:
             raise HTTPException(status_code=400, detail=err)
+
+        # a redirect is not proof: only a new entry (new id, our reason) in the ERP's own list is
+        notice = _page_notices(resp.text)
+        created = _find_created(_parse_outpass_list(resp.text), known, reason)
+        if created is None:
+            listing, cookie_jar = await _authed_get(client, URL_OUTPASS_LIST, cookie_jar, username, password)
+            created = _find_created(_parse_outpass_list(listing.text), known, reason)
+        logger.info(f"[{tag}] {username}: ERP answered {resp.status_code}; new request={created['id'] if created else None}; notice={notice!r}")
+        if created is None:
+            raise HTTPException(
+                status_code=400 if notice else 502,
+                detail=notice or "The ERP did not add this outpass to your list, so it was probably rejected. Nothing was created. Check the times and try again.",
+            )
+        success_message = (
+            f"{success_message} (request {created['id']}, status {created['status']})"
+            + (f" Note: the ERP recorded the out time as {created['out_time'][:16]}, not {expected_out}." if created["out_time"][:16] != expected_out else "")
+            + (f" The ERP also said: {notice}" if notice else "")
+        )
     return {
         "success": True,
         "message": success_message,
+        "outpass": created,
         **_session_response(cookie_jar, php_sess_id, device_id, server_id, unquote(csrf_cookie) if csrf_cookie else ""),
     }
 
@@ -1868,7 +1917,7 @@ async def apply_outpass_local(
             f"{_OP}[hostotpiid_snack_required]": yn(snack),
             f"{_OP}[hostotpiid_dinner_required]": yn(dinner),
         },
-        date, username, password, php_sess_id, csrf_cookie, device_id, server_id,
+        reason, f"{date} {out_time[:5]}", username, password, php_sess_id, csrf_cookie, device_id, server_id,
         "Local outpass applied successfully! Waiting for warden approval.",
     )
 
@@ -1898,7 +1947,7 @@ async def apply_outpass_home(
             f"{_OP}[hostotpiid_in_time]": in_datetime,
             f"{_OP}[hostotpiid_otpass_reason]": reason,
         },
-        out_datetime.split()[0], username, password, php_sess_id, csrf_cookie, device_id, server_id,
+        reason, out_datetime[:16], username, password, php_sess_id, csrf_cookie, device_id, server_id,
         "Home outpass applied successfully! Waiting for warden approval.",
     )
 
